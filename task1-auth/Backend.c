@@ -1,12 +1,17 @@
+#include "auth_protocol.h"
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #define PROC_STATUS_PATH "/proc/self/status"
 #define PROC_STATUS_LINE_MAX 256u
+#define BACKEND_LISTEN_BACKLOG 4
 
 static void log_startup_uids(FILE *out)
 {
@@ -58,13 +63,156 @@ static int log_proc_status_uid_lines(FILE *out)
     return 0;
 }
 
+static void close_logged(int fd, FILE *out, const char *label)
+{
+    if (fd >= 0 && close(fd) != 0) {
+        fprintf(out, "[backend] error closing %s: %s\n", label, strerror(errno));
+    }
+}
+
+static void unlink_socket_path(FILE *out)
+{
+    if (unlink(AUTH_SOCKET_PATH) != 0 && errno != ENOENT) {
+        fprintf(out, "[backend] unable to remove %s: %s\n",
+                AUTH_SOCKET_PATH, strerror(errno));
+    }
+}
+
+static int create_server_socket(FILE *out)
+{
+    int server_fd;
+    struct sockaddr_un address;
+    size_t path_length;
+
+    server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        fprintf(out, "[backend] socket() failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+
+    path_length = strlen(AUTH_SOCKET_PATH);
+    if (path_length >= sizeof(address.sun_path)) {
+        fprintf(out, "[backend] socket path too long: %s\n", AUTH_SOCKET_PATH);
+        close_logged(server_fd, out, "server socket");
+        return -1;
+    }
+
+    memcpy(address.sun_path, AUTH_SOCKET_PATH, path_length + 1u);
+
+    unlink_socket_path(out);
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        fprintf(out, "[backend] bind(%s) failed: %s\n",
+                AUTH_SOCKET_PATH, strerror(errno));
+        close_logged(server_fd, out, "server socket");
+        return -1;
+    }
+
+    if (listen(server_fd, BACKEND_LISTEN_BACKLOG) != 0) {
+        fprintf(out, "[backend] listen() failed: %s\n", strerror(errno));
+        close_logged(server_fd, out, "server socket");
+        unlink_socket_path(out);
+        return -1;
+    }
+
+    fprintf(out, "[backend] listening on %s\n", AUTH_SOCKET_PATH);
+    return server_fd;
+}
+
+static int accept_one_client(int server_fd, FILE *out)
+{
+    int client_fd;
+
+    for (;;) {
+        client_fd = accept(server_fd, NULL, NULL);
+        if (client_fd >= 0) {
+            fprintf(out, "[backend] accepted one client connection\n");
+            return client_fd;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        fprintf(out, "[backend] accept() failed: %s\n", strerror(errno));
+        return -1;
+    }
+}
+
+static int write_all(int fd, const void *buffer, size_t length, FILE *out)
+{
+    const unsigned char *cursor = (const unsigned char *)buffer;
+
+    while (length > 0u) {
+        ssize_t written = write(fd, cursor, length);
+
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            fprintf(out, "[backend] write() failed: %s\n", strerror(errno));
+            return -1;
+        }
+
+        if (written == 0) {
+            fputs("[backend] write() returned zero bytes\n", out);
+            return -1;
+        }
+
+        cursor += (size_t)written;
+        length -= (size_t)written;
+    }
+
+    return 0;
+}
+
+static int send_test_response(int client_fd, FILE *out)
+{
+    AuthResponse response;
+
+    memset(&response, 0, sizeof(response));
+    response.version = AUTH_PROTOCOL_VERSION;
+    response.result = AUTH_RESULT_SUCCESS;
+    response.error_code = AUTH_ERROR_NONE;
+    snprintf(response.message, sizeof(response.message), "backend test response");
+
+    if (write_all(client_fd, &response, sizeof(response), out) != 0) {
+        return -1;
+    }
+
+    fprintf(out, "[backend] sent test response: %s\n", response.message);
+    return 0;
+}
+
 int main(void)
 {
     FILE *log = stdout;
+    int server_fd;
+    int client_fd;
+    int exit_code = EXIT_FAILURE;
 
     fputs("[backend] startup\n", log);
     log_startup_uids(log);
     (void)log_proc_status_uid_lines(log);
 
-    return EXIT_SUCCESS;
+    server_fd = create_server_socket(log);
+    if (server_fd < 0) {
+        return EXIT_FAILURE;
+    }
+
+    client_fd = accept_one_client(server_fd, log);
+    if (client_fd >= 0) {
+        if (send_test_response(client_fd, log) == 0) {
+            exit_code = EXIT_SUCCESS;
+        }
+        close_logged(client_fd, log, "client socket");
+    }
+
+    close_logged(server_fd, log, "server socket");
+    unlink_socket_path(log);
+
+    return exit_code;
 }
