@@ -1,4 +1,5 @@
 #include "auth_protocol.h"
+#include "secure_memory.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -169,22 +170,111 @@ static int write_all(int fd, const void *buffer, size_t length, FILE *out)
     return 0;
 }
 
-static int send_test_response(int client_fd, FILE *out)
+static int read_all(int fd, void *buffer, size_t length, FILE *out)
 {
-    AuthResponse response;
+    unsigned char *cursor = (unsigned char *)buffer;
 
-    memset(&response, 0, sizeof(response));
-    response.version = AUTH_PROTOCOL_VERSION;
-    response.result = AUTH_RESULT_SUCCESS;
-    response.error_code = AUTH_ERROR_NONE;
-    snprintf(response.message, sizeof(response.message), "backend test response");
+    while (length > 0u) {
+        ssize_t received = read(fd, cursor, length);
 
-    if (write_all(client_fd, &response, sizeof(response), out) != 0) {
-        return -1;
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            fprintf(out, "[backend] read() failed: %s\n", strerror(errno));
+            return -1;
+        }
+
+        if (received == 0) {
+            fputs("[backend] client closed before sending a complete request\n", out);
+            return -1;
+        }
+
+        cursor += (size_t)received;
+        length -= (size_t)received;
     }
 
-    fprintf(out, "[backend] sent test response: %s\n", response.message);
     return 0;
+}
+
+static void set_response(AuthResponse *response, AuthResult result,
+                         AuthErrorCode error_code, const char *message)
+{
+    memset(response, 0, sizeof(*response));
+    response->version = AUTH_PROTOCOL_VERSION;
+    response->result = (uint32_t)result;
+    response->error_code = (uint32_t)error_code;
+    snprintf(response->message, sizeof(response->message), "%s", message);
+}
+
+static void process_request(const AuthRequest *request, AuthResponse *response,
+                            FILE *out)
+{
+    if (request->version != AUTH_PROTOCOL_VERSION) {
+        set_response(response, AUTH_RESULT_REJECTED,
+                     AUTH_ERROR_UNSUPPORTED_VERSION,
+                     "unsupported protocol version");
+        fprintf(out, "[backend] rejected protocol version %u\n",
+                (unsigned)request->version);
+        return;
+    }
+
+    if (request->type != AUTH_REQUEST_VALIDATE) {
+        set_response(response, AUTH_RESULT_REJECTED, AUTH_ERROR_BAD_REQUEST,
+                     "unsupported authentication request type");
+        fprintf(out, "[backend] rejected request type %u\n",
+                (unsigned)request->type);
+        return;
+    }
+
+    if (memchr(request->username, '\0', sizeof(request->username)) == NULL ||
+        request->username[0] == '\0') {
+        set_response(response, AUTH_RESULT_REJECTED, AUTH_ERROR_USERNAME_REQUIRED,
+                     "a valid username is required");
+        fputs("[backend] rejected request with invalid username\n", out);
+        return;
+    }
+
+    if (memchr(request->password, '\0', sizeof(request->password)) == NULL ||
+        request->password[0] == '\0') {
+        set_response(response, AUTH_RESULT_REJECTED, AUTH_ERROR_PASSWORD_REQUIRED,
+                     "a valid password is required");
+        fputs("[backend] rejected request with invalid password\n", out);
+        return;
+    }
+
+    set_response(response, AUTH_RESULT_SUCCESS, AUTH_ERROR_NONE,
+                 "authentication request received");
+    fprintf(out, "[backend] accepted authentication request for %s\n",
+            request->username);
+}
+
+static int handle_client(int client_fd, FILE *out)
+{
+    AuthRequest request;
+    AuthResponse response;
+    int result = -1;
+
+    memset(&request, 0, sizeof(request));
+    memset(&response, 0, sizeof(response));
+
+    if (read_all(client_fd, &request, sizeof(request), out) != 0) {
+        goto cleanup;
+    }
+
+    process_request(&request, &response, out);
+
+    if (write_all(client_fd, &response, sizeof(response), out) != 0) {
+        goto cleanup;
+    }
+
+    fprintf(out, "[backend] sent response: result=%u error=%u\n",
+            (unsigned)response.result, (unsigned)response.error_code);
+    result = 0;
+
+cleanup:
+    secure_clear(&request, sizeof(request));
+    return result;
 }
 
 int main(void)
@@ -205,7 +295,7 @@ int main(void)
 
     client_fd = accept_one_client(server_fd, log);
     if (client_fd >= 0) {
-        if (send_test_response(client_fd, log) == 0) {
+        if (handle_client(client_fd, log) == 0) {
             exit_code = EXIT_SUCCESS;
         }
         close_logged(client_fd, log, "client socket");

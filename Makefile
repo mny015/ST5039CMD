@@ -18,8 +18,8 @@ $(TASK1_BUILD):
 $(TASK1_BUILD)/Frontend: $(TASK1_DIR)/Frontend.c $(TASK1_DIR)/auth_protocol.h $(TASK1_DIR)/secure_memory.c $(TASK1_DIR)/secure_memory.h | $(TASK1_BUILD)
 	$(CC) $(CFLAGS) -o $@ $(TASK1_DIR)/Frontend.c $(TASK1_DIR)/secure_memory.c
 
-$(TASK1_BUILD)/Backend: $(TASK1_DIR)/Backend.c | $(TASK1_BUILD)
-	$(CC) $(CFLAGS) -o $@ $(TASK1_DIR)/Backend.c
+$(TASK1_BUILD)/Backend: $(TASK1_DIR)/Backend.c $(TASK1_DIR)/auth_protocol.h $(TASK1_DIR)/secure_memory.c $(TASK1_DIR)/secure_memory.h | $(TASK1_BUILD)
+	$(CC) $(CFLAGS) -o $@ $(TASK1_DIR)/Backend.c $(TASK1_DIR)/secure_memory.c
 
 task2: $(TASK2_BUILD)/Sandbox \
 	$(TASK2_BUILD)/normal_exit \
