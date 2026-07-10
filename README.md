@@ -52,12 +52,33 @@ make clean
 
 ## Run Task 1
 
+Build the two programs, then configure the backend as a set-user-ID root
+executable for the privilege-drop demonstration. Perform this setup only in
+the coursework Linux VM:
+
 ```sh
-cd task1-auth
-./run_task1.sh
+make task1
+sudo chown root:root task1-auth/build/Backend
+sudo chmod 4755 task1-auth/build/Backend
 ```
 
-The frontend currently validates bounded username and password input. Password entry uses terminal echo suppression where `termios` is available, and password buffers are wiped with `secure_clear()`.
+Start the backend in one terminal:
+
+```sh
+./task1-auth/build/Backend
+```
+
+Run the frontend in another terminal:
+
+```sh
+./task1-auth/build/Frontend
+```
+
+Use the fake credentials `demo_user` and `demo_password`. The backend loads
+`credentials.demo`, permanently drops to the invoking user's UID, verifies the
+client's kernel-reported UNIX socket credentials, and then validates the
+structured authentication request. Do not store real passwords in the demo
+credential file.
 
 ## Run Task 2
 
