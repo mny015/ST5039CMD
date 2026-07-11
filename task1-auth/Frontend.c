@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "auth_protocol.h"
 #include "secure_memory.h"
 
@@ -7,6 +9,7 @@
 #include <string.h>
 
 #if !defined(_WIN32)
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -28,6 +31,41 @@ typedef struct TerminalEchoState {
 #endif
     int restore_required;
 } TerminalEchoState;
+
+#if FRONTEND_HAS_UNIX_SOCKET
+static volatile sig_atomic_t frontend_interrupted = 0;
+
+static void handle_frontend_signal(int signal_number)
+{
+    (void)signal_number;
+    frontend_interrupted = 1;
+}
+
+static int install_frontend_signal_handlers(void)
+{
+    struct sigaction termination_action;
+    struct sigaction pipe_action;
+
+    memset(&termination_action, 0, sizeof(termination_action));
+    termination_action.sa_handler = handle_frontend_signal;
+    sigemptyset(&termination_action.sa_mask);
+    if (sigaction(SIGINT, &termination_action, NULL) != 0 ||
+        sigaction(SIGTERM, &termination_action, NULL) != 0) {
+        perror("sigaction");
+        return -1;
+    }
+
+    memset(&pipe_action, 0, sizeof(pipe_action));
+    pipe_action.sa_handler = SIG_IGN;
+    sigemptyset(&pipe_action.sa_mask);
+    if (sigaction(SIGPIPE, &pipe_action, NULL) != 0) {
+        perror("sigaction");
+        return -1;
+    }
+
+    return 0;
+}
+#endif
 
 static void discard_remaining_input_line(void)
 {
@@ -88,10 +126,23 @@ static int read_username(char *username, size_t username_size)
     size_t newline_index;
     size_t input_length;
 
+#if FRONTEND_HAS_UNIX_SOCKET
+    if (frontend_interrupted) {
+        fputs("Authentication input interrupted.\n", stderr);
+        return -1;
+    }
+#endif
+
     printf("Username: ");
     fflush(stdout);
 
     if (fgets(input, sizeof(input), stdin) == NULL) {
+#if FRONTEND_HAS_UNIX_SOCKET
+        if (frontend_interrupted) {
+            fputs("Authentication input interrupted.\n", stderr);
+            return -1;
+        }
+#endif
         if (feof(stdin)) {
             fputs("No username provided.\n", stderr);
         } else {
@@ -137,6 +188,13 @@ static int read_password(char *password, size_t password_size)
 
     memset(input, 0, sizeof(input));
 
+#if FRONTEND_HAS_UNIX_SOCKET
+    if (frontend_interrupted) {
+        fputs("Password input interrupted.\n", stderr);
+        return -1;
+    }
+#endif
+
     printf("Password: ");
     fflush(stdout);
 
@@ -144,6 +202,16 @@ static int read_password(char *password, size_t password_size)
         secure_clear(input, sizeof(input));
         return -1;
     }
+
+#if FRONTEND_HAS_UNIX_SOCKET
+    if (frontend_interrupted) {
+        (void)restore_terminal_echo(&echo_state);
+        putchar('\n');
+        fputs("Password input interrupted.\n", stderr);
+        secure_clear(input, sizeof(input));
+        return -1;
+    }
+#endif
 
     if (fgets(input, sizeof(input), stdin) == NULL) {
         read_failed = 1;
@@ -163,6 +231,14 @@ static int read_password(char *password, size_t password_size)
     }
 
     putchar('\n');
+
+#if FRONTEND_HAS_UNIX_SOCKET
+    if (frontend_interrupted) {
+        fputs("Password input interrupted.\n", stderr);
+        secure_clear(input, sizeof(input));
+        return -1;
+    }
+#endif
 
     if (read_failed) {
         if (feof(stdin)) {
@@ -210,6 +286,10 @@ static int write_all(int fd, const void *buffer, size_t length)
 
         if (written < 0) {
             if (errno == EINTR) {
+                if (frontend_interrupted) {
+                    fputs("Authentication request interrupted.\n", stderr);
+                    return -1;
+                }
                 continue;
             }
             perror("write");
@@ -238,6 +318,10 @@ static int read_all(int fd, void *buffer, size_t length)
 
         if (received < 0) {
             if (errno == EINTR) {
+                if (frontend_interrupted) {
+                    fputs("Authentication response interrupted.\n", stderr);
+                    return -1;
+                }
                 continue;
             }
             perror("read");
@@ -291,18 +375,29 @@ static int connect_to_backend(void)
     return socket_fd;
 }
 
-static int exchange_auth_request(const AuthRequest *request, AuthResponse *response)
+static int exchange_auth_request(AuthRequest *request, AuthResponse *response)
 {
-    int socket_fd = connect_to_backend();
+    int socket_fd;
     int result = -1;
 
+    if (frontend_interrupted) {
+        fputs("Authentication request cancelled.\n", stderr);
+        secure_clear(request, sizeof(*request));
+        return -1;
+    }
+
+    socket_fd = connect_to_backend();
+
     if (socket_fd < 0) {
+        secure_clear(request, sizeof(*request));
         return -1;
     }
 
     if (write_all(socket_fd, request, sizeof(*request)) != 0) {
+        secure_clear(request, sizeof(*request));
         goto cleanup;
     }
+    secure_clear(request, sizeof(*request));
 
     if (read_all(socket_fd, response, sizeof(*response)) != 0) {
         goto cleanup;
@@ -311,6 +406,7 @@ static int exchange_auth_request(const AuthRequest *request, AuthResponse *respo
     result = 0;
 
 cleanup:
+    secure_clear(request, sizeof(*request));
     if (close(socket_fd) != 0) {
         perror("close");
         result = -1;
@@ -331,35 +427,49 @@ int main(void)
     request.version = AUTH_PROTOCOL_VERSION;
     request.type = AUTH_REQUEST_VALIDATE;
 
+#if FRONTEND_HAS_UNIX_SOCKET
+    if (install_frontend_signal_handlers() != 0) {
+        goto cleanup;
+    }
+#endif
+
     if (read_username(request.username, sizeof(request.username)) != 0) {
-        return EXIT_FAILURE;
+        goto cleanup;
     }
 
     if (read_password(request.password, sizeof(request.password)) != 0) {
-        secure_clear(&request, sizeof(request));
-        return EXIT_FAILURE;
+        goto cleanup;
     }
 
 #if FRONTEND_HAS_UNIX_SOCKET
     if (exchange_auth_request(&request, &response) == 0) {
-        response.message[AUTH_RESPONSE_MESSAGE_MAX] = '\0';
-        if (response.version != AUTH_PROTOCOL_VERSION) {
+        if (memchr(response.message, '\0', sizeof(response.message)) == NULL) {
+            fputs("Backend returned a malformed response message.\n", stderr);
+        } else if (response.version != AUTH_PROTOCOL_VERSION) {
             fprintf(stderr, "Unsupported backend protocol version: %u\n",
                     (unsigned)response.version);
         } else {
-            printf("Backend response: result=%u error=%u message=%s\n",
-                   (unsigned)response.result,
-                   (unsigned)response.error_code,
-                   response.message);
-            exit_code = response.result == AUTH_RESULT_SUCCESS
-                            ? EXIT_SUCCESS
-                            : EXIT_FAILURE;
+            if (response.result == AUTH_RESULT_SUCCESS) {
+                printf("Authentication succeeded: %s (result=%u, error=%u)\n",
+                       response.message,
+                       (unsigned)response.result,
+                       (unsigned)response.error_code);
+                exit_code = EXIT_SUCCESS;
+            } else {
+                fprintf(stderr,
+                        "Authentication failed: %s (result=%u, error=%u)\n",
+                        response.message,
+                        (unsigned)response.result,
+                        (unsigned)response.error_code);
+            }
         }
     }
 #else
     fputs("UNIX domain sockets are not supported by this build.\n", stderr);
 #endif
 
+cleanup:
     secure_clear(&request, sizeof(request));
+    secure_clear(&response, sizeof(response));
     return exit_code;
 }

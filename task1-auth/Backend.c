@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <grp.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,42 @@ typedef struct DemoCredential {
     char username[AUTH_USERNAME_MAX + 1u];
     char password[AUTH_PASSWORD_MAX + 1u];
 } DemoCredential;
+
+static volatile sig_atomic_t stop_requested = 0;
+
+static void request_stop(int signal_number)
+{
+    (void)signal_number;
+    stop_requested = 1;
+}
+
+static int install_signal_handlers(FILE *out)
+{
+    struct sigaction termination_action;
+    struct sigaction pipe_action;
+
+    memset(&termination_action, 0, sizeof(termination_action));
+    termination_action.sa_handler = request_stop;
+    sigemptyset(&termination_action.sa_mask);
+
+    if (sigaction(SIGINT, &termination_action, NULL) != 0 ||
+        sigaction(SIGTERM, &termination_action, NULL) != 0) {
+        fprintf(out, "[backend] unable to install termination handlers: %s\n",
+                strerror(errno));
+        return -1;
+    }
+
+    memset(&pipe_action, 0, sizeof(pipe_action));
+    pipe_action.sa_handler = SIG_IGN;
+    sigemptyset(&pipe_action.sa_mask);
+    if (sigaction(SIGPIPE, &pipe_action, NULL) != 0) {
+        fprintf(out, "[backend] unable to ignore SIGPIPE: %s\n",
+                strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
 
 static void log_uids(FILE *out, const char *stage)
 {
@@ -296,6 +333,41 @@ static void unlink_socket_path(FILE *out)
     }
 }
 
+static int remove_stale_socket_path(FILE *out)
+{
+    struct stat socket_status;
+
+    if (lstat(AUTH_SOCKET_PATH, &socket_status) != 0) {
+        if (errno == ENOENT) {
+            return 0;
+        }
+        fprintf(out, "[backend] unable to inspect %s: %s\n",
+                AUTH_SOCKET_PATH, strerror(errno));
+        return -1;
+    }
+
+    if (!S_ISSOCK(socket_status.st_mode)) {
+        fprintf(out, "[backend] refusing to remove non-socket path %s\n",
+                AUTH_SOCKET_PATH);
+        return -1;
+    }
+
+    if (socket_status.st_uid != geteuid()) {
+        fprintf(out, "[backend] refusing to remove socket owned by UID %lu\n",
+                (unsigned long)socket_status.st_uid);
+        return -1;
+    }
+
+    if (unlink(AUTH_SOCKET_PATH) != 0) {
+        fprintf(out, "[backend] unable to remove stale socket %s: %s\n",
+                AUTH_SOCKET_PATH, strerror(errno));
+        return -1;
+    }
+
+    fprintf(out, "[backend] removed stale socket %s\n", AUTH_SOCKET_PATH);
+    return 0;
+}
+
 static int create_server_socket(FILE *out)
 {
     int server_fd;
@@ -319,7 +391,10 @@ static int create_server_socket(FILE *out)
     }
 
     memcpy(address.sun_path, AUTH_SOCKET_PATH, path_length + 1u);
-    unlink_socket_path(out);
+    if (remove_stale_socket_path(out) != 0) {
+        close_logged(server_fd, out, "server socket");
+        return -1;
+    }
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
         fprintf(out, "[backend] bind(%s) failed: %s\n",
@@ -352,6 +427,11 @@ static int accept_one_client(int server_fd, FILE *out)
     int client_fd;
 
     for (;;) {
+        if (stop_requested) {
+            fputs("[backend] shutdown requested before accept\n", out);
+            return -1;
+        }
+
         client_fd = accept(server_fd, NULL, NULL);
         if (client_fd >= 0) {
             fputs("[backend] accepted one client connection\n", out);
@@ -359,6 +439,10 @@ static int accept_one_client(int server_fd, FILE *out)
         }
 
         if (errno == EINTR) {
+            if (stop_requested) {
+                fputs("[backend] accept interrupted by shutdown request\n", out);
+                return -1;
+            }
             continue;
         }
 
@@ -408,10 +492,19 @@ static int write_all(int fd, const void *buffer, size_t length, FILE *out)
     const unsigned char *cursor = (const unsigned char *)buffer;
 
     while (length > 0u) {
+        if (stop_requested) {
+            fputs("[backend] shutdown requested before write completed\n", out);
+            return -1;
+        }
+
         ssize_t written = write(fd, cursor, length);
 
         if (written < 0) {
             if (errno == EINTR) {
+                if (stop_requested) {
+                    fputs("[backend] write interrupted by shutdown request\n", out);
+                    return -1;
+                }
                 continue;
             }
             fprintf(out, "[backend] write() failed: %s\n", strerror(errno));
@@ -435,10 +528,19 @@ static int read_all(int fd, void *buffer, size_t length, FILE *out)
     unsigned char *cursor = (unsigned char *)buffer;
 
     while (length > 0u) {
+        if (stop_requested) {
+            fputs("[backend] shutdown requested before request completed\n", out);
+            return -1;
+        }
+
         ssize_t received = read(fd, cursor, length);
 
         if (received < 0) {
             if (errno == EINTR) {
+                if (stop_requested) {
+                    fputs("[backend] read interrupted by shutdown request\n", out);
+                    return -1;
+                }
                 continue;
             }
             fprintf(out, "[backend] read() failed: %s\n", strerror(errno));
@@ -467,22 +569,79 @@ static void set_response(AuthResponse *response, AuthResult result,
     snprintf(response->message, sizeof(response->message), "%s", message);
 }
 
-static int secure_field_equal(const char *left, const char *right, size_t length)
+static int secure_string_equal(const char *left, size_t left_length,
+                               const char *right, size_t right_length,
+                               size_t maximum_length)
 {
-    unsigned char difference = 0u;
+    size_t difference = left_length ^ right_length;
     size_t index;
 
-    for (index = 0u; index < length; index++) {
-        difference |= (unsigned char)left[index] ^ (unsigned char)right[index];
+    for (index = 0u; index < maximum_length; index++) {
+        unsigned char left_byte = index < left_length
+                                      ? (unsigned char)left[index]
+                                      : 0u;
+        unsigned char right_byte = index < right_length
+                                       ? (unsigned char)right[index]
+                                       : 0u;
+
+        difference |= (size_t)(left_byte ^ right_byte);
     }
 
     return difference == 0u;
+}
+
+static int validate_request_string(const char *value, size_t capacity,
+                                   size_t maximum_length,
+                                   const char *field_name,
+                                   AuthErrorCode empty_error,
+                                   AuthErrorCode oversized_error,
+                                   size_t *value_length,
+                                   AuthResponse *response, FILE *out)
+{
+    const char *terminator = memchr(value, '\0', capacity);
+
+    if (terminator == NULL) {
+        char message[AUTH_RESPONSE_MESSAGE_MAX + 1u];
+
+        snprintf(message, sizeof(message),
+                 "%s is oversized or not null-terminated", field_name);
+        set_response(response, AUTH_RESULT_REJECTED, oversized_error, message);
+        fprintf(out,
+                "[backend] rejected %s without a null terminator within %lu bytes\n",
+                field_name, (unsigned long)capacity);
+        return -1;
+    }
+
+    *value_length = (size_t)(terminator - value);
+    if (*value_length == 0u) {
+        char message[AUTH_RESPONSE_MESSAGE_MAX + 1u];
+
+        snprintf(message, sizeof(message), "%s must not be empty", field_name);
+        set_response(response, AUTH_RESULT_REJECTED, empty_error, message);
+        fprintf(out, "[backend] rejected empty %s\n", field_name);
+        return -1;
+    }
+
+    if (*value_length > maximum_length) {
+        char message[AUTH_RESPONSE_MESSAGE_MAX + 1u];
+
+        snprintf(message, sizeof(message), "%s exceeds maximum length", field_name);
+        set_response(response, AUTH_RESULT_REJECTED, oversized_error, message);
+        fprintf(out, "[backend] rejected oversized %s\n", field_name);
+        return -1;
+    }
+
+    return 0;
 }
 
 static void process_request(const AuthRequest *request,
                             const DemoCredential *credential,
                             AuthResponse *response, FILE *out)
 {
+    size_t credential_password_length;
+    size_t credential_username_length;
+    size_t password_length;
+    size_t username_length;
     int username_matches;
     int password_matches;
 
@@ -503,30 +662,42 @@ static void process_request(const AuthRequest *request,
         return;
     }
 
-    if (memchr(request->username, '\0', sizeof(request->username)) == NULL ||
-        request->username[0] == '\0') {
-        set_response(response, AUTH_RESULT_REJECTED, AUTH_ERROR_USERNAME_REQUIRED,
-                     "a valid username is required");
-        fputs("[backend] rejected request with invalid username\n", out);
+    if (validate_request_string(request->username, sizeof(request->username),
+                                AUTH_USERNAME_MAX, "username",
+                                AUTH_ERROR_USERNAME_REQUIRED,
+                                AUTH_ERROR_USERNAME_TOO_LONG,
+                                &username_length, response, out) != 0) {
         return;
     }
 
-    if (memchr(request->password, '\0', sizeof(request->password)) == NULL ||
-        request->password[0] == '\0') {
-        set_response(response, AUTH_RESULT_REJECTED, AUTH_ERROR_PASSWORD_REQUIRED,
-                     "a valid password is required");
-        fputs("[backend] rejected request with invalid password\n", out);
+    if (validate_request_string(request->password, sizeof(request->password),
+                                AUTH_PASSWORD_MAX, "password",
+                                AUTH_ERROR_PASSWORD_REQUIRED,
+                                AUTH_ERROR_PASSWORD_TOO_LONG,
+                                &password_length, response, out) != 0) {
         return;
     }
 
-    username_matches = secure_field_equal(request->username,
-                                          credential->username,
-                                          sizeof(request->username));
-    password_matches = secure_field_equal(request->password,
-                                          credential->password,
-                                          sizeof(request->password));
+    credential_username_length = strlen(credential->username);
+    credential_password_length = strlen(credential->password);
+    username_matches = secure_string_equal(request->username, username_length,
+                                           credential->username,
+                                           credential_username_length,
+                                           AUTH_USERNAME_MAX);
+    password_matches = secure_string_equal(request->password, password_length,
+                                           credential->password,
+                                           credential_password_length,
+                                           AUTH_PASSWORD_MAX);
 
-    if (!(username_matches & password_matches)) {
+    if (!username_matches) {
+        set_response(response, AUTH_RESULT_INVALID_CREDENTIALS, AUTH_ERROR_NONE,
+                     "invalid username or password");
+        fprintf(out, "[backend] authentication rejected for unknown user %s\n",
+                request->username);
+        return;
+    }
+
+    if (!password_matches) {
         set_response(response, AUTH_RESULT_INVALID_CREDENTIALS, AUTH_ERROR_NONE,
                      "invalid username or password");
         fprintf(out, "[backend] authentication rejected for %s\n",
@@ -591,8 +762,15 @@ int main(void)
 
     memset(credential_path, 0, sizeof(credential_path));
     memset(&credential, 0, sizeof(credential));
+    if (setvbuf(log, NULL, _IOLBF, 0u) != 0) {
+        fputs("[backend] unable to configure line-buffered logging\n", stderr);
+        return EXIT_FAILURE;
+    }
 
     fputs("[backend] startup\n", log);
+    if (install_signal_handlers(log) != 0) {
+        goto cleanup;
+    }
     log_uids(log, "startup");
     (void)log_proc_status_uid_lines(log, "startup");
 

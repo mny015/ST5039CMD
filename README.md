@@ -74,6 +74,16 @@ Run the frontend in another terminal:
 ./task1-auth/build/Frontend
 ```
 
+Alternatively, run the automated valid-login, wrong-password, and
+unknown-user demonstration:
+
+```sh
+./task1-auth/run_task1.sh
+```
+
+The script prints the backend UID and `SO_PEERCRED` output for each case and
+saves the backend logs under `task1-auth/build/`.
+
 Use the fake credentials `demo_user` and `demo_password`. The backend loads
 `credentials.demo`, permanently drops to the invoking user's UID, verifies the
 client's kernel-reported UNIX socket credentials, and then validates the
