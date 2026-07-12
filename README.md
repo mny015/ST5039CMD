@@ -97,4 +97,15 @@ cd task2-sandbox
 ./run_task2.sh
 ```
 
-The sandbox files are arranged for the controller, monitor, logger, and test binaries required by the coursework. The implementation can be expanded in place without changing the repository layout.
+The script builds Task 2 and supervises the `normal_exit` test binary with the
+default five-second timeout. To exercise timeout termination and the SIGKILL
+fallback directly, run:
+
+```sh
+./task2-sandbox/build/Sandbox --timeout 2 ./task2-sandbox/build/infinite_loop
+./task2-sandbox/build/Sandbox --timeout 2 ./task2-sandbox/build/ignore_sigterm
+```
+
+The parent reports the child PID and final `waitpid()` status. A timeout is
+requested by the monitor thread; the parent sends SIGTERM, waits one second,
+and sends SIGKILL only if the child remains alive.

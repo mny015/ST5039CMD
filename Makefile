@@ -1,5 +1,6 @@
 CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -pedantic
+THREAD_FLAGS ?= -pthread
 
 TASK1_DIR := task1-auth
 TASK1_BUILD := $(TASK1_DIR)/build
@@ -32,7 +33,7 @@ $(TASK2_BUILD):
 	mkdir -p $@
 
 $(TASK2_BUILD)/Sandbox: $(TASK2_DIR)/Sandbox.c $(TASK2_DIR)/monitor.c $(TASK2_DIR)/monitor.h $(TASK2_DIR)/logger.c $(TASK2_DIR)/logger.h | $(TASK2_BUILD)
-	$(CC) $(CFLAGS) -o $@ $(TASK2_DIR)/Sandbox.c $(TASK2_DIR)/monitor.c $(TASK2_DIR)/logger.c
+	$(CC) $(CFLAGS) $(THREAD_FLAGS) -o $@ $(TASK2_DIR)/Sandbox.c $(TASK2_DIR)/monitor.c $(TASK2_DIR)/logger.c
 
 $(TASK2_BUILD)/normal_exit: $(TASK2_TEST_DIR)/normal_exit.c | $(TASK2_BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
