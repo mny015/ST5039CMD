@@ -97,15 +97,17 @@ cd task2-sandbox
 ./run_task2.sh
 ```
 
-The script builds Task 2 and supervises the `normal_exit` test binary with the
-default five-second timeout. To exercise timeout termination and the SIGKILL
-fallback directly, run:
+The script builds Task 2 and demonstrates normal exit, timeout termination,
+memory-limit termination, CPU monitoring, and the SIGKILL fallback. Individual
+tests can also be run directly:
 
 ```sh
 ./task2-sandbox/build/Sandbox --timeout 2 ./task2-sandbox/build/infinite_loop
+./task2-sandbox/build/Sandbox --timeout 10 --memory-kb 16384 ./task2-sandbox/build/memory_hog
 ./task2-sandbox/build/Sandbox --timeout 2 ./task2-sandbox/build/ignore_sigterm
 ```
 
-The parent reports the child PID and final `waitpid()` status. A timeout is
-requested by the monitor thread; the parent sends SIGTERM, waits one second,
-and sends SIGKILL only if the child remains alive.
+The parent reports the child PID and final `waitpid()` status. Monitor threads
+sample `/proc/<pid>/status` and `/proc/<pid>/stat`; timeout and memory breaches
+request termination through shared state. The parent sends SIGTERM, waits one
+second, and sends SIGKILL only if the child remains alive.

@@ -15,7 +15,10 @@
 
 #define DEFAULT_TIMEOUT_SECONDS 5u
 #define MAXIMUM_TIMEOUT_SECONDS 86400u
+#define MAXIMUM_MEMORY_LIMIT_KILOBYTES (4ul * 1024ul * 1024ul)
 #define MONITOR_POLL_MILLISECONDS 100u
+#define MEMORY_POLL_MILLISECONDS 100u
+#define CPU_POLL_MILLISECONDS 250u
 #define SUPERVISOR_POLL_MILLISECONDS 50u
 #define TERMINATION_GRACE_MILLISECONDS 1000u
 
@@ -25,16 +28,19 @@ typedef struct SandboxOptions {
     const char *target_path;
     char **target_argv;
     unsigned int timeout_seconds;
+    unsigned long memory_limit_kilobytes;
 } SandboxOptions;
 
 static void print_usage(const char *program_name)
 {
     fprintf(stderr,
-            "Usage: %s [--timeout SECONDS] <target-binary> [args...]\n",
+            "Usage: %s [--timeout SECONDS] [--memory-kb KILOBYTES] "
+            "<target-binary> [args...]\n",
             program_name);
 }
 
-static int parse_timeout(const char *value, unsigned int *timeout_seconds)
+static int parse_unsigned_limit(const char *value, unsigned long maximum,
+                                unsigned long *parsed_value)
 {
     char *end = NULL;
     unsigned long parsed;
@@ -42,35 +48,70 @@ static int parse_timeout(const char *value, unsigned int *timeout_seconds)
     errno = 0;
     parsed = strtoul(value, &end, 10);
     if (errno != 0 || end == value || *end != '\0' || parsed == 0u ||
-        parsed > MAXIMUM_TIMEOUT_SECONDS) {
+        parsed > maximum) {
         return -1;
     }
 
-    *timeout_seconds = (unsigned int)parsed;
+    *parsed_value = parsed;
     return 0;
 }
 
 static int parse_options(int argc, char **argv, SandboxOptions *options)
 {
-    int target_index = 1;
+    int argument_index = 1;
 
     options->timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
+    options->memory_limit_kilobytes = 0u;
 
-    if (argc > 1 && strcmp(argv[1], "--timeout") == 0) {
-        if (argc < 4 || parse_timeout(argv[2], &options->timeout_seconds) != 0) {
-            fputs("Invalid timeout. Use an integer from 1 to 86400 seconds.\n",
-                  stderr);
+    while (argument_index < argc) {
+        if (strcmp(argv[argument_index], "--timeout") == 0) {
+            unsigned long timeout;
+
+            if (argument_index + 1 >= argc ||
+                parse_unsigned_limit(argv[argument_index + 1],
+                                     MAXIMUM_TIMEOUT_SECONDS,
+                                     &timeout) != 0) {
+                fputs("Invalid timeout. Use an integer from 1 to 86400 "
+                      "seconds.\n", stderr);
+                return -1;
+            }
+            options->timeout_seconds = (unsigned int)timeout;
+            argument_index += 2;
+            continue;
+        }
+
+        if (strcmp(argv[argument_index], "--memory-kb") == 0) {
+            if (argument_index + 1 >= argc ||
+                parse_unsigned_limit(argv[argument_index + 1],
+                                     MAXIMUM_MEMORY_LIMIT_KILOBYTES,
+                                     &options->memory_limit_kilobytes) != 0) {
+                fputs("Invalid memory limit. Use an integer from 1 to "
+                      "4194304 kilobytes.\n", stderr);
+                return -1;
+            }
+            argument_index += 2;
+            continue;
+        }
+
+        if (strcmp(argv[argument_index], "--") == 0) {
+            argument_index++;
+            break;
+        }
+
+        if (argv[argument_index][0] == '-') {
+            fprintf(stderr, "Unknown sandbox option: %s\n",
+                    argv[argument_index]);
             return -1;
         }
-        target_index = 3;
+        break;
     }
 
-    if (target_index >= argc || argv[target_index][0] == '\0') {
+    if (argument_index >= argc || argv[argument_index][0] == '\0') {
         return -1;
     }
 
-    options->target_path = argv[target_index];
-    options->target_argv = &argv[target_index];
+    options->target_path = argv[argument_index];
+    options->target_argv = &argv[argument_index];
     return 0;
 }
 
@@ -247,13 +288,19 @@ int main(int argc, char **argv)
 {
     SandboxOptions options;
     SandboxState state;
-    TimeoutMonitorConfig monitor_config;
+    TimeoutMonitorConfig timeout_config;
+    MemoryMonitorConfig memory_config;
+    CpuMonitorConfig cpu_config;
     SandboxTerminationReason final_reason = SANDBOX_TERMINATION_NONE;
-    pthread_t monitor_thread;
+    pthread_t timeout_thread;
+    pthread_t memory_thread;
+    pthread_t cpu_thread;
     pid_t child_pid;
     int child_status = 0;
     int child_started = 0;
-    int monitor_started = 0;
+    int timeout_monitor_started = 0;
+    int memory_monitor_started = 0;
+    int cpu_monitor_started = 0;
     int state_initialized = 0;
     int child_reaped = 0;
     int exit_code = EXIT_FAILURE;
@@ -268,8 +315,10 @@ int main(int argc, char **argv)
     }
     state_initialized = 1;
 
-    logger_info("sandbox controller starting: target=%s timeout=%u seconds",
-                options.target_path, options.timeout_seconds);
+    logger_info("sandbox controller starting: target=%s timeout=%u seconds "
+                "memory_limit=%lu kB",
+                options.target_path, options.timeout_seconds,
+                options.memory_limit_kilobytes);
 
     child_pid = fork();
     if (child_pid < 0) {
@@ -294,21 +343,56 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    monitor_config.state = &state;
-    monitor_config.timeout_seconds = options.timeout_seconds;
-    monitor_config.poll_interval_milliseconds = MONITOR_POLL_MILLISECONDS;
+    timeout_config.state = &state;
+    timeout_config.timeout_seconds = options.timeout_seconds;
+    timeout_config.poll_interval_milliseconds = MONITOR_POLL_MILLISECONDS;
+
+    memory_config.state = &state;
+    memory_config.memory_limit_kilobytes = options.memory_limit_kilobytes;
+    memory_config.poll_interval_milliseconds = MEMORY_POLL_MILLISECONDS;
+
+    cpu_config.state = &state;
+    cpu_config.poll_interval_milliseconds = CPU_POLL_MILLISECONDS;
 
     {
-        int thread_result = pthread_create(&monitor_thread, NULL,
+        int thread_result = pthread_create(&timeout_thread, NULL,
                                            timeout_monitor_thread,
-                                           &monitor_config);
+                                           &timeout_config);
         if (thread_result != 0) {
             logger_error("timeout monitor thread creation failed: %s",
                          strerror(thread_result));
             (void)sandbox_state_request_termination(
                 &state, SANDBOX_TERMINATION_MONITOR_ERROR);
         } else {
-            monitor_started = 1;
+            timeout_monitor_started = 1;
+        }
+    }
+
+    if (options.memory_limit_kilobytes > 0u) {
+        int thread_result = pthread_create(&memory_thread, NULL,
+                                           memory_monitor_thread,
+                                           &memory_config);
+        if (thread_result != 0) {
+            logger_error("memory monitor thread creation failed: %s",
+                         strerror(thread_result));
+            (void)sandbox_state_request_termination(
+                &state, SANDBOX_TERMINATION_MONITOR_ERROR);
+        } else {
+            memory_monitor_started = 1;
+        }
+    }
+
+    {
+        int thread_result = pthread_create(&cpu_thread, NULL,
+                                           cpu_monitor_thread,
+                                           &cpu_config);
+        if (thread_result != 0) {
+            logger_error("CPU monitor thread creation failed: %s",
+                         strerror(thread_result));
+            (void)sandbox_state_request_termination(
+                &state, SANDBOX_TERMINATION_MONITOR_ERROR);
+        } else {
+            cpu_monitor_started = 1;
         }
     }
 
@@ -335,11 +419,29 @@ cleanup:
         (void)sandbox_state_mark_child_exited(&state);
     }
 
-    if (monitor_started) {
-        int join_result = pthread_join(monitor_thread, NULL);
+    if (timeout_monitor_started) {
+        int join_result = pthread_join(timeout_thread, NULL);
 
         if (join_result != 0) {
             logger_error("timeout monitor thread join failed: %s",
+                         strerror(join_result));
+        }
+    }
+
+    if (memory_monitor_started) {
+        int join_result = pthread_join(memory_thread, NULL);
+
+        if (join_result != 0) {
+            logger_error("memory monitor thread join failed: %s",
+                         strerror(join_result));
+        }
+    }
+
+    if (cpu_monitor_started) {
+        int join_result = pthread_join(cpu_thread, NULL);
+
+        if (join_result != 0) {
+            logger_error("CPU monitor thread join failed: %s",
                          strerror(join_result));
         }
     }

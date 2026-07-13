@@ -7,8 +7,9 @@
 typedef enum SandboxTerminationReason {
     SANDBOX_TERMINATION_NONE = 0,
     SANDBOX_TERMINATION_TIMEOUT = 1,
-    SANDBOX_TERMINATION_MONITOR_ERROR = 2,
-    SANDBOX_TERMINATION_SUPERVISOR_ERROR = 3
+    SANDBOX_TERMINATION_MEMORY_LIMIT = 2,
+    SANDBOX_TERMINATION_MONITOR_ERROR = 3,
+    SANDBOX_TERMINATION_SUPERVISOR_ERROR = 4
 } SandboxTerminationReason;
 
 typedef struct SandboxState {
@@ -32,6 +33,17 @@ typedef struct TimeoutMonitorConfig {
     unsigned int poll_interval_milliseconds;
 } TimeoutMonitorConfig;
 
+typedef struct MemoryMonitorConfig {
+    SandboxState *state;
+    unsigned long memory_limit_kilobytes;
+    unsigned int poll_interval_milliseconds;
+} MemoryMonitorConfig;
+
+typedef struct CpuMonitorConfig {
+    SandboxState *state;
+    unsigned int poll_interval_milliseconds;
+} CpuMonitorConfig;
+
 int sandbox_state_init(SandboxState *state);
 int sandbox_state_set_child(SandboxState *state, pid_t child_pid);
 int sandbox_state_snapshot(SandboxState *state,
@@ -43,5 +55,7 @@ int sandbox_state_destroy(SandboxState *state);
 
 const char *sandbox_termination_reason_name(SandboxTerminationReason reason);
 void *timeout_monitor_thread(void *argument);
+void *memory_monitor_thread(void *argument);
+void *cpu_monitor_thread(void *argument);
 
 #endif
