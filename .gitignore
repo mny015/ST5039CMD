@@ -1,8 +1,24 @@
+# Compiler and linker output
 *.o
 *.out
 *.exe
+build/
+
+# Runtime evidence and process artifacts
 *.log
+*.sock
+*.pid
+core
+core.*
+vgcore.*
+
+# Temporary and editor files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
 .DS_Store
 __pycache__/
 .vscode/
-build/
