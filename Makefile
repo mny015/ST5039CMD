@@ -13,7 +13,8 @@ TASK2_TEST_BINARIES := \
 	$(TASK2_BUILD)/infinite_loop \
 	$(TASK2_BUILD)/memory_hog \
 	$(TASK2_BUILD)/sleep_long \
-	$(TASK2_BUILD)/ignore_sigterm
+	$(TASK2_BUILD)/ignore_sigterm \
+	$(TASK2_BUILD)/fork_escape
 
 .PHONY: task1 task2 task2-tests scripts task1-demo task2-demo clean evidence
 
@@ -39,8 +40,8 @@ scripts:
 $(TASK2_BUILD):
 	mkdir -p $@
 
-$(TASK2_BUILD)/Sandbox: $(TASK2_DIR)/Sandbox.c $(TASK2_DIR)/monitor.c $(TASK2_DIR)/monitor.h $(TASK2_DIR)/logger.c $(TASK2_DIR)/logger.h | $(TASK2_BUILD)
-	$(CC) $(CFLAGS) $(THREAD_FLAGS) -o $@ $(TASK2_DIR)/Sandbox.c $(TASK2_DIR)/monitor.c $(TASK2_DIR)/logger.c
+$(TASK2_BUILD)/Sandbox: $(TASK2_DIR)/Sandbox.c $(TASK2_DIR)/monitor.c $(TASK2_DIR)/monitor.h $(TASK2_DIR)/process_tree.c $(TASK2_DIR)/process_tree.h $(TASK2_DIR)/logger.c $(TASK2_DIR)/logger.h | $(TASK2_BUILD)
+	$(CC) $(CFLAGS) $(THREAD_FLAGS) -o $@ $(TASK2_DIR)/Sandbox.c $(TASK2_DIR)/monitor.c $(TASK2_DIR)/process_tree.c $(TASK2_DIR)/logger.c
 
 $(TASK2_BUILD)/normal_exit: $(TASK2_TEST_DIR)/normal_exit.c | $(TASK2_BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
@@ -55,6 +56,9 @@ $(TASK2_BUILD)/sleep_long: $(TASK2_TEST_DIR)/sleep_long.c | $(TASK2_BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
 
 $(TASK2_BUILD)/ignore_sigterm: $(TASK2_TEST_DIR)/ignore_sigterm.c | $(TASK2_BUILD)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(TASK2_BUILD)/fork_escape: $(TASK2_TEST_DIR)/fork_escape.c | $(TASK2_BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
 
 task1-demo: task1 scripts

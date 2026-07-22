@@ -1,13 +1,15 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include "logger.h"
 #include "monitor.h"
+#include "process_tree.h"
 
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -21,6 +23,7 @@
 #define CPU_POLL_MILLISECONDS 250u
 #define SUPERVISOR_POLL_MILLISECONDS 50u
 #define TERMINATION_GRACE_MILLISECONDS 1000u
+#define FORCE_KILL_WAIT_MILLISECONDS 5000u
 
 extern char **environ;
 
@@ -30,6 +33,12 @@ typedef struct SandboxOptions {
     unsigned int timeout_seconds;
     unsigned long memory_limit_kilobytes;
 } SandboxOptions;
+
+typedef struct WorkloadStatus {
+    int leader_status;
+    int leader_status_available;
+    unsigned long reaped_processes;
+} WorkloadStatus;
 
 static void print_usage(const char *program_name)
 {
@@ -132,124 +141,235 @@ static int sleep_milliseconds(unsigned int milliseconds)
     return 0;
 }
 
-static int wait_for_child(pid_t child_pid, int options, int *child_status)
+static int enable_child_subreaper(void)
 {
-    pid_t wait_result;
-
-    do {
-        wait_result = waitpid(child_pid, child_status, options);
-    } while (wait_result < 0 && errno == EINTR);
-
-    if (wait_result == child_pid) {
-        return 1;
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1) != 0) {
+        logger_error("PR_SET_CHILD_SUBREAPER failed: %s", strerror(errno));
+        return -1;
     }
-    if (wait_result == 0) {
-        return 0;
-    }
-
-    logger_error("waitpid(%ld) failed: %s", (long)child_pid, strerror(errno));
-    return -1;
+    logger_info("controller registered as a Linux child subreaper");
+    return 0;
 }
 
-static int wait_during_grace_period(pid_t child_pid, int *child_status)
+static int reap_available_children(SandboxState *state,
+                                   WorkloadStatus *workload_status)
+{
+    for (;;) {
+        int status;
+        pid_t reaped_pid = waitpid((pid_t)-1, &status, WNOHANG);
+
+        if (reaped_pid > 0) {
+            workload_status->reaped_processes++;
+            if (reaped_pid == state->child_pid &&
+                !workload_status->leader_status_available) {
+                workload_status->leader_status = status;
+                workload_status->leader_status_available = 1;
+                (void)sandbox_state_mark_leader_exited(state);
+                logger_info("reaped original workload leader PID %ld",
+                            (long)reaped_pid);
+            } else {
+                logger_info("reaped descendant workload PID %ld",
+                            (long)reaped_pid);
+            }
+            continue;
+        }
+
+        if (reaped_pid == 0) {
+            return 0;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == ECHILD) {
+            return 0;
+        }
+
+        logger_error("waitpid(-1) failed: %s", strerror(errno));
+        return -1;
+    }
+}
+
+static int poll_workload(SandboxState *state,
+                         WorkloadStatus *workload_status,
+                         int *workload_alive)
+{
+    SandboxStateSnapshot snapshot;
+    ProcessTreeSample sample;
+
+    if (reap_available_children(state, workload_status) != 0 ||
+        sandbox_state_snapshot(state, &snapshot) != 0) {
+        return -1;
+    }
+
+    if (process_tree_sample(snapshot.supervisor_pid, snapshot.child_pid,
+                            snapshot.leader_alive, &sample) != 0) {
+        logger_error("supervisor could not sample the workload process tree");
+        return -1;
+    }
+
+    *workload_alive = sample.process_count > 0u;
+    process_tree_sample_destroy(&sample);
+    if (!*workload_alive) {
+        (void)sandbox_state_mark_workload_exited(state);
+    }
+    return 0;
+}
+
+static int signal_workload(SandboxState *state, int signal_number)
+{
+    SandboxStateSnapshot snapshot;
+    ProcessTreeSample sample;
+    size_t index;
+    size_t signalled_processes = 0u;
+    int group_signalled = 0;
+    int result = 0;
+
+    if (sandbox_state_snapshot(state, &snapshot) != 0) {
+        return -1;
+    }
+    memset(&sample, 0, sizeof(sample));
+
+    if (snapshot.child_process_group_id > 0) {
+        if (kill(-snapshot.child_process_group_id, signal_number) == 0) {
+            group_signalled = 1;
+        } else if (errno != ESRCH) {
+            logger_error("signal %d delivery to PGID %ld failed: %s",
+                         signal_number,
+                         (long)snapshot.child_process_group_id,
+                         strerror(errno));
+            result = -1;
+        }
+    }
+
+    if (process_tree_sample(snapshot.supervisor_pid, snapshot.child_pid,
+                            snapshot.leader_alive, &sample) != 0) {
+        logger_error("could not collect process tree before signal %d",
+                     signal_number);
+        return -1;
+    }
+
+    for (index = 0u; index < sample.process_count; index++) {
+        const ProcessTreeProcess *process = &sample.processes[index];
+
+        if (process->pid <= 0 || process->pid == snapshot.supervisor_pid ||
+            (group_signalled && process->process_group_id ==
+                                    snapshot.child_process_group_id)) {
+            continue;
+        }
+
+        if (kill(process->pid, signal_number) == 0) {
+            signalled_processes++;
+        } else if (errno != ESRCH) {
+            logger_error("signal %d delivery to workload PID %ld failed: %s",
+                         signal_number, (long)process->pid, strerror(errno));
+            result = -1;
+        }
+    }
+
+    logger_warn("signal %d delivered to workload tree: PGID=%ld "
+                "discovered_processes=%zu individually_signalled=%zu",
+                signal_number, (long)snapshot.child_process_group_id,
+                sample.process_count, signalled_processes);
+    process_tree_sample_destroy(&sample);
+    return result;
+}
+
+static int wait_for_workload_exit(SandboxState *state,
+                                  WorkloadStatus *workload_status,
+                                  unsigned int timeout_milliseconds,
+                                  int repeat_sigkill)
 {
     unsigned int waited_milliseconds = 0u;
 
-    while (waited_milliseconds < TERMINATION_GRACE_MILLISECONDS) {
-        int wait_result = wait_for_child(child_pid, WNOHANG, child_status);
+    for (;;) {
+        int workload_alive;
 
-        if (wait_result != 0) {
-            return wait_result;
+        if (poll_workload(state, workload_status, &workload_alive) != 0) {
+            return -1;
+        }
+        if (!workload_alive) {
+            return 0;
+        }
+        if (repeat_sigkill) {
+            (void)signal_workload(state, SIGKILL);
+        }
+        if (waited_milliseconds >= timeout_milliseconds) {
+            return 1;
         }
         if (sleep_milliseconds(SUPERVISOR_POLL_MILLISECONDS) != 0) {
-            logger_error("grace-period sleep failed: %s", strerror(errno));
+            logger_error("workload wait sleep failed: %s", strerror(errno));
             return -1;
         }
         waited_milliseconds += SUPERVISOR_POLL_MILLISECONDS;
     }
-
-    return wait_for_child(child_pid, WNOHANG, child_status);
 }
 
-static int terminate_child(pid_t child_pid,
-                           SandboxTerminationReason reason,
-                           int *child_status)
+static int terminate_workload(SandboxState *state,
+                              SandboxTerminationReason reason,
+                              WorkloadStatus *workload_status)
 {
     int wait_result;
 
-    logger_warn("termination policy activated for PID %ld: %s",
-                (long)child_pid, sandbox_termination_reason_name(reason));
+    logger_warn("termination policy activated for workload tree: %s",
+                sandbox_termination_reason_name(reason));
+    (void)signal_workload(state, SIGTERM);
+    logger_warn("waiting %u ms for workload-wide SIGTERM shutdown",
+                TERMINATION_GRACE_MILLISECONDS);
 
-    if (kill(child_pid, SIGTERM) != 0) {
-        if (errno == ESRCH) {
-            logger_info("PID %ld had already exited before SIGTERM",
-                        (long)child_pid);
-        } else {
-            logger_error("SIGTERM delivery to PID %ld failed: %s",
-                         (long)child_pid, strerror(errno));
-        }
-    } else {
-        logger_warn("SIGTERM sent to PID %ld; waiting %u ms",
-                    (long)child_pid, TERMINATION_GRACE_MILLISECONDS);
-    }
-
-    wait_result = wait_during_grace_period(child_pid, child_status);
-    if (wait_result > 0) {
-        logger_info("PID %ld exited during the SIGTERM grace period",
-                    (long)child_pid);
+    wait_result = wait_for_workload_exit(state, workload_status,
+                                         TERMINATION_GRACE_MILLISECONDS, 0);
+    if (wait_result == 0) {
+        logger_info("entire workload exited during the SIGTERM grace period");
         return 0;
     }
 
-    if (wait_result < 0 && errno == ECHILD) {
-        return -1;
+    logger_warn("workload descendants remain; escalating tree to SIGKILL");
+    (void)signal_workload(state, SIGKILL);
+    wait_result = wait_for_workload_exit(state, workload_status,
+                                         FORCE_KILL_WAIT_MILLISECONDS, 1);
+    if (wait_result == 0) {
+        logger_info("entire workload tree terminated and reaped");
+        return 0;
     }
 
-    logger_warn("PID %ld is still alive; sending SIGKILL", (long)child_pid);
-    if (kill(child_pid, SIGKILL) != 0 && errno != ESRCH) {
-        logger_error("SIGKILL delivery to PID %ld failed: %s",
-                     (long)child_pid, strerror(errno));
-        return -1;
-    }
-
-    wait_result = wait_for_child(child_pid, 0, child_status);
-    return wait_result > 0 ? 0 : -1;
+    logger_error("unable to confirm termination of the entire workload tree");
+    return -1;
 }
 
-static int supervise_child(SandboxState *state, int *child_status,
-                           SandboxTerminationReason *final_reason)
+static int supervise_workload(SandboxState *state,
+                              WorkloadStatus *workload_status,
+                              SandboxTerminationReason *termination_reason)
 {
     for (;;) {
         SandboxStateSnapshot snapshot;
-        int wait_result;
+        int workload_alive;
 
-        wait_result = wait_for_child(state->child_pid, WNOHANG, child_status);
-        if (wait_result > 0) {
-            *final_reason = SANDBOX_TERMINATION_NONE;
-            return 0;
+        if (poll_workload(state, workload_status, &workload_alive) != 0) {
+            *termination_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
+            return terminate_workload(state, *termination_reason,
+                                      workload_status);
         }
-        if (wait_result < 0) {
-            *final_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
-            return terminate_child(state->child_pid, *final_reason,
-                                   child_status);
+        if (!workload_alive) {
+            *termination_reason = SANDBOX_TERMINATION_NONE;
+            return 0;
         }
 
         if (sandbox_state_snapshot(state, &snapshot) != 0) {
-            *final_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
-            return terminate_child(state->child_pid, *final_reason,
-                                   child_status);
+            *termination_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
+            return terminate_workload(state, *termination_reason,
+                                      workload_status);
         }
-
         if (snapshot.termination_requested) {
-            *final_reason = snapshot.termination_reason;
-            return terminate_child(snapshot.child_pid, snapshot.termination_reason,
-                                   child_status);
+            *termination_reason = snapshot.termination_reason;
+            return terminate_workload(state, snapshot.termination_reason,
+                                      workload_status);
         }
 
         if (sleep_milliseconds(SUPERVISOR_POLL_MILLISECONDS) != 0) {
             logger_error("supervisor sleep failed: %s", strerror(errno));
-            *final_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
-            return terminate_child(state->child_pid, *final_reason,
-                                   child_status);
+            *termination_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
+            return terminate_workload(state, *termination_reason,
+                                      workload_status);
         }
     }
 }
@@ -261,25 +381,25 @@ static int report_child_status(int child_status,
         int exit_code = WEXITSTATUS(child_status);
 
         if (exit_code == 0 && termination_reason == SANDBOX_TERMINATION_NONE) {
-            logger_info("final child status: normal exit (code=0)");
+            logger_info("final workload status: normal leader exit (code=0) "
+                        "and no descendants remain");
             return EXIT_SUCCESS;
         }
 
-        logger_warn("final child status: abnormal exit (code=%d, reason=%s)",
+        logger_warn("final workload status: leader exit code=%d reason=%s",
                     exit_code,
                     sandbox_termination_reason_name(termination_reason));
         return EXIT_FAILURE;
     }
 
     if (WIFSIGNALED(child_status)) {
-        logger_warn("final child status: signal termination "
-                    "(signal=%d, reason=%s)",
+        logger_warn("final workload status: leader signal=%d reason=%s",
                     WTERMSIG(child_status),
                     sandbox_termination_reason_name(termination_reason));
         return EXIT_FAILURE;
     }
 
-    logger_error("final child status: unrecognized waitpid status 0x%x",
+    logger_error("final workload status: unrecognized waitpid status 0x%x",
                  child_status);
     return EXIT_FAILURE;
 }
@@ -291,20 +411,21 @@ int main(int argc, char **argv)
     TimeoutMonitorConfig timeout_config;
     MemoryMonitorConfig memory_config;
     CpuMonitorConfig cpu_config;
-    SandboxTerminationReason final_reason = SANDBOX_TERMINATION_NONE;
+    WorkloadStatus workload_status;
+    SandboxTerminationReason termination_reason = SANDBOX_TERMINATION_NONE;
     pthread_t timeout_thread;
     pthread_t memory_thread;
     pthread_t cpu_thread;
     pid_t child_pid;
-    int child_status = 0;
     int child_started = 0;
+    int workload_finished = 0;
     int timeout_monitor_started = 0;
     int memory_monitor_started = 0;
     int cpu_monitor_started = 0;
     int state_initialized = 0;
-    int child_reaped = 0;
     int exit_code = EXIT_FAILURE;
 
+    memset(&workload_status, 0, sizeof(workload_status));
     if (parse_options(argc, argv, &options) != 0) {
         print_usage(argv[0]);
         return EXIT_FAILURE;
@@ -314,6 +435,9 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     state_initialized = 1;
+    if (enable_child_subreaper() != 0) {
+        goto cleanup;
+    }
 
     logger_info("sandbox controller starting: target=%s timeout=%u seconds "
                 "memory_limit=%lu kB",
@@ -327,6 +451,12 @@ int main(int argc, char **argv)
     }
 
     if (child_pid == 0) {
+        if (setpgid(0, 0) != 0) {
+            dprintf(STDERR_FILENO,
+                    "sandbox child: setpgid() failed: %s\n",
+                    strerror(errno));
+            _exit(127);
+        }
         execve(options.target_path, options.target_argv, environ);
         dprintf(STDERR_FILENO, "sandbox child: execve(%s) failed: %s\n",
                 options.target_path, strerror(errno));
@@ -334,14 +464,24 @@ int main(int argc, char **argv)
     }
 
     child_started = 1;
-    logger_info("parent supervising child PID %ld", (long)child_pid);
-    if (sandbox_state_set_child(&state, child_pid) != 0) {
-        final_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
-        if (terminate_child(child_pid, final_reason, &child_status) == 0) {
-            child_reaped = 1;
-        }
+    if (setpgid(child_pid, child_pid) != 0 &&
+        errno != EACCES && errno != ESRCH) {
+        logger_error("parent setpgid(%ld) failed: %s",
+                     (long)child_pid, strerror(errno));
+        termination_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
+    }
+
+    if (sandbox_state_set_workload(&state, child_pid, child_pid) != 0) {
+        logger_error("unable to initialize workload process-tree state");
+        (void)kill(child_pid, SIGKILL);
+        (void)waitpid(child_pid, NULL, 0);
+        child_started = 0;
         goto cleanup;
     }
+
+    logger_info("supervising process tree: leader PID=%ld PGID=%ld "
+                "subreaper PID=%ld",
+                (long)child_pid, (long)child_pid, (long)getpid());
 
     timeout_config.state = &state;
     timeout_config.timeout_seconds = options.timeout_seconds;
@@ -396,27 +536,30 @@ int main(int argc, char **argv)
         }
     }
 
-    if (supervise_child(&state, &child_status, &final_reason) == 0) {
-        child_reaped = 1;
+    if (termination_reason != SANDBOX_TERMINATION_NONE) {
+        if (terminate_workload(&state, termination_reason,
+                               &workload_status) == 0) {
+            workload_finished = 1;
+        }
+    } else if (supervise_workload(&state, &workload_status,
+                                  &termination_reason) == 0) {
+        workload_finished = 1;
     }
 
 cleanup:
-    if (child_started && !child_reaped) {
-        if (final_reason == SANDBOX_TERMINATION_NONE) {
-            final_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
+    if (child_started && !workload_finished) {
+        if (termination_reason == SANDBOX_TERMINATION_NONE) {
+            termination_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
         }
-        logger_warn("performing final cleanup for unreaped PID %ld",
-                    (long)child_pid);
-        if (terminate_child(child_pid, final_reason, &child_status) == 0) {
-            child_reaped = 1;
-        } else {
-            logger_error("unable to confirm that PID %ld was reaped",
-                         (long)child_pid);
+        logger_warn("performing cleanup for an active workload tree");
+        if (terminate_workload(&state, termination_reason,
+                               &workload_status) == 0) {
+            workload_finished = 1;
         }
     }
 
-    if (child_started) {
-        (void)sandbox_state_mark_child_exited(&state);
+    if (child_started && workload_finished) {
+        (void)sandbox_state_mark_workload_exited(&state);
     }
 
     if (timeout_monitor_started) {
@@ -446,8 +589,13 @@ cleanup:
         }
     }
 
-    if (child_reaped) {
-        exit_code = report_child_status(child_status, final_reason);
+    if (workload_finished && workload_status.leader_status_available) {
+        logger_info("workload cleanup complete: reaped_processes=%lu",
+                    workload_status.reaped_processes);
+        exit_code = report_child_status(workload_status.leader_status,
+                                        termination_reason);
+    } else if (child_started) {
+        logger_error("original workload leader status was not collected");
     }
 
     if (state_initialized) {

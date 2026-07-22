@@ -5,8 +5,8 @@ Operating Systems coursework CW1. It has two Linux-focused programs:
 
 - **Task 1:** a privilege-separated authentication frontend and backend that
   communicate through a structured UNIX domain socket protocol.
-- **Task 2:** a sandbox controller that supervises a child process and enforces
-  timeout and memory policies from parent-owned monitor threads.
+- **Task 2:** a sandbox controller that supervises a complete process tree and
+  enforces timeout and memory policies from parent-owned monitor threads.
 
 ## Requirements
 
@@ -41,6 +41,8 @@ ST5039CMD-CW1/
 |   |-- Sandbox.c
 |   |-- monitor.c
 |   |-- monitor.h
+|   |-- process_tree.c
+|   |-- process_tree.h
 |   |-- logger.c
 |   |-- logger.h
 |   |-- run_task2.sh
@@ -49,7 +51,8 @@ ST5039CMD-CW1/
 |       |-- infinite_loop.c
 |       |-- memory_hog.c
 |       |-- sleep_long.c
-|       `-- ignore_sigterm.c
+|       |-- ignore_sigterm.c
+|       `-- fork_escape.c
 `-- diagrams/
     |-- task1-architecture.png
     `-- task2-architecture.png
@@ -145,12 +148,14 @@ again before each additional manual login attempt.
 
 ## Task 2: Sandbox Controller
 
-The sandbox controller forks and executes a target binary, then supervises it
-with `waitpid()`. Timeout, memory, and CPU monitor threads observe the child
-externally and communicate through mutex-protected shared state. When a limit
-is exceeded, the parent sends `SIGTERM`, waits one second, and escalates to
-`SIGKILL` if the child is still alive. A mutex-protected logger keeps output
-from concurrent threads readable.
+The sandbox controller forks and executes a target binary in a dedicated
+process group, registers itself as a Linux child subreaper, and supervises the
+entire descendant tree with `waitpid()` and `/proc` ancestry checks. Timeout,
+memory, and CPU monitor threads aggregate observations across that tree and
+communicate through mutex-protected shared state. When a limit is exceeded,
+the parent sends `SIGTERM`, waits one second, and escalates every surviving
+descendant to `SIGKILL`. A mutex-protected logger keeps concurrent output
+readable.
 
 ### Automated Run
 
@@ -165,6 +170,7 @@ The script demonstrates:
 - memory-limit termination
 - CPU usage monitoring
 - `SIGTERM` to `SIGKILL` escalation
+- detached-descendant detection after the original leader exits
 
 Normal exit returns status `0`. Cases terminated by sandbox policy return a
 non-zero status, which the demonstration script checks automatically.

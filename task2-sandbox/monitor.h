@@ -13,16 +13,22 @@ typedef enum SandboxTerminationReason {
 } SandboxTerminationReason;
 
 typedef struct SandboxState {
+    pid_t supervisor_pid;
     pid_t child_pid;
-    int child_alive;
+    pid_t child_process_group_id;
+    int leader_alive;
+    int workload_alive;
     int termination_requested;
     SandboxTerminationReason termination_reason;
     pthread_mutex_t mutex;
 } SandboxState;
 
 typedef struct SandboxStateSnapshot {
+    pid_t supervisor_pid;
     pid_t child_pid;
-    int child_alive;
+    pid_t child_process_group_id;
+    int leader_alive;
+    int workload_alive;
     int termination_requested;
     SandboxTerminationReason termination_reason;
 } SandboxStateSnapshot;
@@ -45,12 +51,14 @@ typedef struct CpuMonitorConfig {
 } CpuMonitorConfig;
 
 int sandbox_state_init(SandboxState *state);
-int sandbox_state_set_child(SandboxState *state, pid_t child_pid);
+int sandbox_state_set_workload(SandboxState *state, pid_t child_pid,
+                               pid_t child_process_group_id);
 int sandbox_state_snapshot(SandboxState *state,
                            SandboxStateSnapshot *snapshot);
 int sandbox_state_request_termination(SandboxState *state,
                                       SandboxTerminationReason reason);
-int sandbox_state_mark_child_exited(SandboxState *state);
+int sandbox_state_mark_leader_exited(SandboxState *state);
+int sandbox_state_mark_workload_exited(SandboxState *state);
 int sandbox_state_destroy(SandboxState *state);
 
 const char *sandbox_termination_reason_name(SandboxTerminationReason reason);

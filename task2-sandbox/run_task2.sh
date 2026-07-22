@@ -37,5 +37,7 @@ run_case cpu-monitoring 1 \
     --timeout 2 "$TEST_DIR/infinite_loop"
 run_case sigterm-sigkill-fallback 1 \
     --timeout 1 "$TEST_DIR/ignore_sigterm"
+run_case process-tree-escape 1 \
+    --timeout 1 "$TEST_DIR/fork_escape"
 
 printf '\nTask 2 demonstration completed successfully.\n'
