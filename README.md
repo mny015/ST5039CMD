@@ -17,10 +17,12 @@ environment with:
 - GNU Make
 - POSIX shell utilities
 - POSIX threads and the Linux `/proc` filesystem
+- Linux Landlock and seccomp support
 
 Task 1 also uses Linux `SO_PEERCRED` and `setresuid()`/`setresgid()`. Task 2
-uses `/proc/<pid>/status` and `/proc/<pid>/stat`. These programs are therefore
-not intended to run natively on Windows.
+uses cgroup v2 when the launching account has delegated cgroup access, with
+`/proc`, `setrlimit()`, and process-tree supervision as its fallback. These
+programs are therefore not intended to run natively on Windows.
 
 ## Repository Structure
 
@@ -43,6 +45,8 @@ ST5039CMD-CW1/
 |   |-- monitor.h
 |   |-- process_tree.c
 |   |-- process_tree.h
+|   |-- security.c
+|   |-- security.h
 |   |-- logger.c
 |   |-- logger.h
 |   |-- run_task2.sh
@@ -52,7 +56,11 @@ ST5039CMD-CW1/
 |       |-- memory_hog.c
 |       |-- sleep_long.c
 |       |-- ignore_sigterm.c
-|       `-- fork_escape.c
+|       |-- fork_escape.c
+|       |-- memory_fork_hog.c
+|       |-- network_attempt.c
+|       |-- filesystem_attempt.c
+|       `-- environment_fds.c
 `-- diagrams/
     |-- task1-architecture.png
     `-- task2-architecture.png
@@ -148,14 +156,25 @@ again before each additional manual login attempt.
 
 ## Task 2: Sandbox Controller
 
-The sandbox controller forks and executes a target binary in a dedicated
-process group, registers itself as a Linux child subreaper, and supervises the
-entire descendant tree with `waitpid()` and `/proc` ancestry checks. Timeout,
-memory, and CPU monitor threads aggregate observations across that tree and
-communicate through mutex-protected shared state. When a limit is exceeded,
-the parent sends `SIGTERM`, waits one second, and escalates every surviving
-descendant to `SIGKILL`. A mutex-protected logger keeps concurrent output
-readable.
+The sandbox controller starts a target binary in a dedicated process group,
+registers itself as a Linux child subreaper, and supervises the complete
+descendant tree with `waitpid()` and `/proc` ancestry checks. A synchronized
+launch prevents target code from running before parent-side setup completes.
+
+When cgroup v2 delegation is available, the controller places the workload in
+its own cgroup, applies `memory.max`, reads aggregate `memory.current`, and uses
+`cgroup.kill` for atomic forced termination. Otherwise, every descendant
+inherits an `RLIMIT_AS` ceiling and the memory monitor aggregates `/proc`
+samples across the tree every 25 milliseconds. Timeout and CPU monitors also
+operate from the parent through mutex-protected shared state.
+
+Before `execve()`, the child applies a Landlock read/execute allowlist and
+write-deny policy, installs a seccomp network-syscall filter, replaces the
+inherited environment with a small fixed environment, and closes every file
+descriptor above standard error. It also configures
+`PR_SET_PDEATHSIG=SIGKILL`. The controller handles `SIGINT`, `SIGTERM`, and
+`SIGHUP` by running the workload-wide `SIGTERM` then `SIGKILL` cleanup policy.
+A mutex-protected logger keeps concurrent output readable.
 
 ### Automated Run
 
@@ -168,9 +187,13 @@ The script demonstrates:
 - normal child exit
 - timeout termination
 - memory-limit termination
+- aggregate memory enforcement across forked children
 - CPU usage monitoring
 - `SIGTERM` to `SIGKILL` escalation
 - detached-descendant detection after the original leader exits
+- network and host-filesystem denial
+- inherited environment and descriptor removal
+- cleanup after graceful and abrupt controller termination
 
 Normal exit returns status `0`. Cases terminated by sandbox policy return a
 non-zero status, which the demonstration script checks automatically.
@@ -201,7 +224,11 @@ Examples from the repository root:
 
 If `--timeout` is omitted, the default is five seconds. Memory enforcement is
 disabled unless `--memory-kb` is provided; CPU monitoring always reports usage
-changes.
+changes. The selected target's resolved directory and system runtime
+directories are readable/executable inside the Landlock policy; host writes,
+unrelated host reads, and network socket operations are denied. The launcher
+fails closed if Landlock or seccomp cannot be installed. It logs whether
+cgroup v2 or the `RLIMIT_AS` plus `/proc` fallback is active.
 
 ## Architecture Diagrams
 

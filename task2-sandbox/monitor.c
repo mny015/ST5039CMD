@@ -181,6 +181,8 @@ const char *sandbox_termination_reason_name(SandboxTerminationReason reason)
         return "monitor error";
     case SANDBOX_TERMINATION_SUPERVISOR_ERROR:
         return "supervisor error";
+    case SANDBOX_TERMINATION_OPERATOR_SIGNAL:
+        return "operator signal";
     default:
         return "unknown reason";
     }
@@ -249,12 +251,17 @@ void *memory_monitor_thread(void *argument)
     MemoryMonitorConfig *config = (MemoryMonitorConfig *)argument;
     unsigned long last_logged_memory = ULONG_MAX;
 
-    logger_info("memory monitor started: tree limit=%lu kB",
+    logger_info("memory monitor started: source=%s limit=%lu kB",
+                config->cgroup->active ? "cgroup v2 memory.current"
+                                       : "process-tree /proc accounting",
                 config->memory_limit_kilobytes);
 
     for (;;) {
         SandboxStateSnapshot snapshot;
         ProcessTreeSample sample;
+        unsigned long sampled_memory;
+        size_t sampled_processes = 0u;
+        const char *sample_source;
         unsigned long memory_change = 0u;
 
         if (sandbox_state_snapshot(config->state, &snapshot) != 0) {
@@ -264,46 +271,68 @@ void *memory_monitor_thread(void *argument)
             return NULL;
         }
 
-        if (process_tree_sample(snapshot.supervisor_pid, snapshot.child_pid,
-                                snapshot.leader_alive, &sample) != 0) {
-            logger_error("memory monitor could not sample the process tree");
-            (void)sandbox_state_request_termination(
-                config->state, SANDBOX_TERMINATION_MONITOR_ERROR);
-            return NULL;
-        }
-        if (sample.process_count == 0u) {
-            process_tree_sample_destroy(&sample);
-            return NULL;
+        memset(&sample, 0, sizeof(sample));
+        if (config->cgroup->active) {
+            int populated = sandbox_cgroup_is_populated(config->cgroup);
+
+            if (populated < 0 ||
+                sandbox_cgroup_read_memory_kilobytes(
+                    config->cgroup, &sampled_memory) != 0) {
+                logger_error("memory monitor could not read cgroup state: %s",
+                             strerror(errno));
+                (void)sandbox_state_request_termination(
+                    config->state, SANDBOX_TERMINATION_MONITOR_ERROR);
+                return NULL;
+            }
+            if (!populated) {
+                return NULL;
+            }
+            sample_source = "cgroup memory.current";
+        } else {
+            if (process_tree_sample(snapshot.supervisor_pid,
+                                    snapshot.child_pid,
+                                    snapshot.leader_alive, &sample) != 0) {
+                logger_error(
+                    "memory monitor could not sample the process tree");
+                (void)sandbox_state_request_termination(
+                    config->state, SANDBOX_TERMINATION_MONITOR_ERROR);
+                return NULL;
+            }
+            if (sample.process_count == 0u) {
+                process_tree_sample_destroy(&sample);
+                return NULL;
+            }
+            sampled_memory = sample.memory_kilobytes;
+            sampled_processes = sample.process_count;
+            sample_source = sample.used_virtual_memory_fallback
+                                ? "aggregate VmRSS/VmSize"
+                                : "aggregate VmRSS";
         }
 
         if (last_logged_memory != ULONG_MAX) {
-            memory_change = sample.memory_kilobytes >= last_logged_memory
-                                ? sample.memory_kilobytes - last_logged_memory
-                                : last_logged_memory - sample.memory_kilobytes;
+            memory_change = sampled_memory >= last_logged_memory
+                                ? sampled_memory - last_logged_memory
+                                : last_logged_memory - sampled_memory;
         }
 
         if (last_logged_memory == ULONG_MAX ||
-            sample.memory_kilobytes >= config->memory_limit_kilobytes ||
+            sampled_memory >= config->memory_limit_kilobytes ||
             memory_change >= 1024u) {
-            logger_info("memory sample: tree_processes=%zu %s=%lu kB "
-                        "limit=%lu kB",
-                        sample.process_count,
-                        sample.used_virtual_memory_fallback
-                            ? "aggregate VmRSS/VmSize"
-                            : "aggregate VmRSS",
-                        sample.memory_kilobytes,
+            logger_info("memory sample: source=%s tree_processes=%zu "
+                        "memory=%lu kB limit=%lu kB",
+                        sample_source, sampled_processes, sampled_memory,
                         config->memory_limit_kilobytes);
-            last_logged_memory = sample.memory_kilobytes;
+            last_logged_memory = sampled_memory;
         }
 
-        if (sample.memory_kilobytes >= config->memory_limit_kilobytes) {
+        if (sampled_memory >= config->memory_limit_kilobytes) {
             int request_result = sandbox_state_request_termination(
                 config->state, SANDBOX_TERMINATION_MEMORY_LIMIT);
 
             if (request_result > 0) {
-                logger_warn("memory limit exceeded by process tree: "
-                            "processes=%zu memory=%lu kB limit=%lu kB",
-                            sample.process_count, sample.memory_kilobytes,
+                logger_warn("memory limit exceeded: source=%s "
+                            "memory=%lu kB limit=%lu kB",
+                            sample_source, sampled_memory,
                             config->memory_limit_kilobytes);
             }
             process_tree_sample_destroy(&sample);

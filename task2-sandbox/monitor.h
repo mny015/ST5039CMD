@@ -1,6 +1,8 @@
 #ifndef TASK2_MONITOR_H
 #define TASK2_MONITOR_H
 
+#include "security.h"
+
 #include <pthread.h>
 #include <sys/types.h>
 
@@ -9,7 +11,8 @@ typedef enum SandboxTerminationReason {
     SANDBOX_TERMINATION_TIMEOUT = 1,
     SANDBOX_TERMINATION_MEMORY_LIMIT = 2,
     SANDBOX_TERMINATION_MONITOR_ERROR = 3,
-    SANDBOX_TERMINATION_SUPERVISOR_ERROR = 4
+    SANDBOX_TERMINATION_SUPERVISOR_ERROR = 4,
+    SANDBOX_TERMINATION_OPERATOR_SIGNAL = 5
 } SandboxTerminationReason;
 
 typedef struct SandboxState {
@@ -41,6 +44,7 @@ typedef struct TimeoutMonitorConfig {
 
 typedef struct MemoryMonitorConfig {
     SandboxState *state;
+    const SandboxCgroup *cgroup;
     unsigned long memory_limit_kilobytes;
     unsigned int poll_interval_milliseconds;
 } MemoryMonitorConfig;

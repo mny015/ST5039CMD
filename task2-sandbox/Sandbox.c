@@ -3,8 +3,10 @@
 #include "logger.h"
 #include "monitor.h"
 #include "process_tree.h"
+#include "security.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,13 +21,13 @@
 #define MAXIMUM_TIMEOUT_SECONDS 86400u
 #define MAXIMUM_MEMORY_LIMIT_KILOBYTES (4ul * 1024ul * 1024ul)
 #define MONITOR_POLL_MILLISECONDS 100u
-#define MEMORY_POLL_MILLISECONDS 100u
+#define MEMORY_POLL_MILLISECONDS 25u
 #define CPU_POLL_MILLISECONDS 250u
 #define SUPERVISOR_POLL_MILLISECONDS 50u
 #define TERMINATION_GRACE_MILLISECONDS 1000u
 #define FORCE_KILL_WAIT_MILLISECONDS 5000u
 
-extern char **environ;
+static volatile sig_atomic_t operator_signal_number = 0;
 
 typedef struct SandboxOptions {
     const char *target_path;
@@ -39,6 +41,86 @@ typedef struct WorkloadStatus {
     int leader_status_available;
     unsigned long reaped_processes;
 } WorkloadStatus;
+
+static void handle_operator_signal(int signal_number)
+{
+    operator_signal_number = signal_number;
+}
+
+static int install_operator_signal_handlers(void)
+{
+    const int handled_signals[] = {SIGINT, SIGTERM, SIGHUP};
+    struct sigaction action;
+    size_t index;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = handle_operator_signal;
+    if (sigemptyset(&action.sa_mask) != 0) {
+        return -1;
+    }
+
+    for (index = 0u;
+         index < sizeof(handled_signals) / sizeof(handled_signals[0]);
+         index++) {
+        if (sigaction(handled_signals[index], &action, NULL) != 0) {
+            return -1;
+        }
+    }
+    action.sa_handler = SIG_IGN;
+    if (sigaction(SIGPIPE, &action, NULL) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int reset_child_signal_handlers(void)
+{
+    const int reset_signals[] = {SIGINT, SIGTERM, SIGHUP, SIGPIPE};
+    struct sigaction action;
+    size_t index;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = SIG_DFL;
+    if (sigemptyset(&action.sa_mask) != 0) {
+        return -1;
+    }
+    for (index = 0u;
+         index < sizeof(reset_signals) / sizeof(reset_signals[0]);
+         index++) {
+        if (sigaction(reset_signals[index], &action, NULL) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int wait_for_launch_permission(int descriptor)
+{
+    unsigned char permission;
+    ssize_t bytes_read;
+
+    do {
+        bytes_read = read(descriptor, &permission, sizeof(permission));
+    } while (bytes_read < 0 && errno == EINTR);
+
+    if (bytes_read != (ssize_t)sizeof(permission) || permission != 1u) {
+        errno = bytes_read < 0 ? errno : ECANCELED;
+        return -1;
+    }
+    return 0;
+}
+
+static int release_child(int descriptor)
+{
+    const unsigned char permission = 1u;
+    ssize_t bytes_written;
+
+    do {
+        bytes_written = write(descriptor, &permission, sizeof(permission));
+    } while (bytes_written < 0 && errno == EINTR);
+
+    return bytes_written == (ssize_t)sizeof(permission) ? 0 : -1;
+}
 
 static void print_usage(const char *program_name)
 {
@@ -190,6 +272,7 @@ static int reap_available_children(SandboxState *state,
 }
 
 static int poll_workload(SandboxState *state,
+                         const SandboxCgroup *cgroup,
                          WorkloadStatus *workload_status,
                          int *workload_alive)
 {
@@ -199,6 +282,21 @@ static int poll_workload(SandboxState *state,
     if (reap_available_children(state, workload_status) != 0 ||
         sandbox_state_snapshot(state, &snapshot) != 0) {
         return -1;
+    }
+
+    if (cgroup->active) {
+        int populated = sandbox_cgroup_is_populated(cgroup);
+
+        if (populated < 0) {
+            logger_error("supervisor could not read cgroup membership: %s",
+                         strerror(errno));
+            return -1;
+        }
+        *workload_alive = populated;
+        if (!*workload_alive) {
+            (void)sandbox_state_mark_workload_exited(state);
+        }
+        return 0;
     }
 
     if (process_tree_sample(snapshot.supervisor_pid, snapshot.child_pid,
@@ -215,7 +313,9 @@ static int poll_workload(SandboxState *state,
     return 0;
 }
 
-static int signal_workload(SandboxState *state, int signal_number)
+static int signal_workload(SandboxState *state,
+                           const SandboxCgroup *cgroup,
+                           int signal_number)
 {
     SandboxStateSnapshot snapshot;
     ProcessTreeSample sample;
@@ -228,6 +328,15 @@ static int signal_workload(SandboxState *state, int signal_number)
         return -1;
     }
     memset(&sample, 0, sizeof(sample));
+
+    if (signal_number == SIGKILL && cgroup->active) {
+        if (sandbox_cgroup_kill(cgroup) == 0) {
+            logger_warn("SIGKILL delivered atomically through cgroup.kill");
+        } else {
+            logger_error("cgroup.kill failed: %s", strerror(errno));
+            result = -1;
+        }
+    }
 
     if (snapshot.child_process_group_id > 0) {
         if (kill(-snapshot.child_process_group_id, signal_number) == 0) {
@@ -275,6 +384,7 @@ static int signal_workload(SandboxState *state, int signal_number)
 }
 
 static int wait_for_workload_exit(SandboxState *state,
+                                  const SandboxCgroup *cgroup,
                                   WorkloadStatus *workload_status,
                                   unsigned int timeout_milliseconds,
                                   int repeat_sigkill)
@@ -284,14 +394,15 @@ static int wait_for_workload_exit(SandboxState *state,
     for (;;) {
         int workload_alive;
 
-        if (poll_workload(state, workload_status, &workload_alive) != 0) {
+        if (poll_workload(state, cgroup, workload_status,
+                          &workload_alive) != 0) {
             return -1;
         }
         if (!workload_alive) {
             return 0;
         }
         if (repeat_sigkill) {
-            (void)signal_workload(state, SIGKILL);
+            (void)signal_workload(state, cgroup, SIGKILL);
         }
         if (waited_milliseconds >= timeout_milliseconds) {
             return 1;
@@ -305,6 +416,7 @@ static int wait_for_workload_exit(SandboxState *state,
 }
 
 static int terminate_workload(SandboxState *state,
+                              const SandboxCgroup *cgroup,
                               SandboxTerminationReason reason,
                               WorkloadStatus *workload_status)
 {
@@ -312,11 +424,11 @@ static int terminate_workload(SandboxState *state,
 
     logger_warn("termination policy activated for workload tree: %s",
                 sandbox_termination_reason_name(reason));
-    (void)signal_workload(state, SIGTERM);
+    (void)signal_workload(state, cgroup, SIGTERM);
     logger_warn("waiting %u ms for workload-wide SIGTERM shutdown",
                 TERMINATION_GRACE_MILLISECONDS);
 
-    wait_result = wait_for_workload_exit(state, workload_status,
+    wait_result = wait_for_workload_exit(state, cgroup, workload_status,
                                          TERMINATION_GRACE_MILLISECONDS, 0);
     if (wait_result == 0) {
         logger_info("entire workload exited during the SIGTERM grace period");
@@ -324,8 +436,8 @@ static int terminate_workload(SandboxState *state,
     }
 
     logger_warn("workload descendants remain; escalating tree to SIGKILL");
-    (void)signal_workload(state, SIGKILL);
-    wait_result = wait_for_workload_exit(state, workload_status,
+    (void)signal_workload(state, cgroup, SIGKILL);
+    wait_result = wait_for_workload_exit(state, cgroup, workload_status,
                                          FORCE_KILL_WAIT_MILLISECONDS, 1);
     if (wait_result == 0) {
         logger_info("entire workload tree terminated and reaped");
@@ -337,6 +449,7 @@ static int terminate_workload(SandboxState *state,
 }
 
 static int supervise_workload(SandboxState *state,
+                              const SandboxCgroup *cgroup,
                               WorkloadStatus *workload_status,
                               SandboxTerminationReason *termination_reason)
 {
@@ -344,9 +457,20 @@ static int supervise_workload(SandboxState *state,
         SandboxStateSnapshot snapshot;
         int workload_alive;
 
-        if (poll_workload(state, workload_status, &workload_alive) != 0) {
+        if (operator_signal_number != 0) {
+            logger_warn("controller received operator signal %d",
+                        (int)operator_signal_number);
+            *termination_reason = SANDBOX_TERMINATION_OPERATOR_SIGNAL;
+            (void)sandbox_state_request_termination(state,
+                                                     *termination_reason);
+            return terminate_workload(state, cgroup, *termination_reason,
+                                      workload_status);
+        }
+
+        if (poll_workload(state, cgroup, workload_status,
+                          &workload_alive) != 0) {
             *termination_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
-            return terminate_workload(state, *termination_reason,
+            return terminate_workload(state, cgroup, *termination_reason,
                                       workload_status);
         }
         if (!workload_alive) {
@@ -356,19 +480,20 @@ static int supervise_workload(SandboxState *state,
 
         if (sandbox_state_snapshot(state, &snapshot) != 0) {
             *termination_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
-            return terminate_workload(state, *termination_reason,
+            return terminate_workload(state, cgroup, *termination_reason,
                                       workload_status);
         }
         if (snapshot.termination_requested) {
             *termination_reason = snapshot.termination_reason;
-            return terminate_workload(state, snapshot.termination_reason,
+            return terminate_workload(state, cgroup,
+                                      snapshot.termination_reason,
                                       workload_status);
         }
 
         if (sleep_milliseconds(SUPERVISOR_POLL_MILLISECONDS) != 0) {
             logger_error("supervisor sleep failed: %s", strerror(errno));
             *termination_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
-            return terminate_workload(state, *termination_reason,
+            return terminate_workload(state, cgroup, *termination_reason,
                                       workload_status);
         }
     }
@@ -404,6 +529,70 @@ static int report_child_status(int child_status,
     return EXIT_FAILURE;
 }
 
+static void run_sandbox_child(const SandboxOptions *options,
+                              int launch_read_descriptor,
+                              int launch_write_descriptor,
+                              pid_t expected_parent)
+{
+    (void)close(launch_write_descriptor);
+    if (reset_child_signal_handlers() != 0) {
+        dprintf(STDERR_FILENO,
+                "sandbox child: could not reset signal handlers: %s\n",
+                strerror(errno));
+        _exit(127);
+    }
+    if (setpgid(0, 0) != 0) {
+        dprintf(STDERR_FILENO, "sandbox child: setpgid() failed: %s\n",
+                strerror(errno));
+        _exit(127);
+    }
+    if (sandbox_child_set_parent_death_signal(expected_parent) != 0) {
+        dprintf(STDERR_FILENO,
+                "sandbox child: PR_SET_PDEATHSIG failed: %s\n",
+                strerror(errno));
+        _exit(127);
+    }
+    if (sandbox_child_set_resource_limits(
+            options->memory_limit_kilobytes) != 0) {
+        dprintf(STDERR_FILENO,
+                "sandbox child: resource-limit setup failed: %s\n",
+                strerror(errno));
+        _exit(127);
+    }
+    if (wait_for_launch_permission(launch_read_descriptor) != 0) {
+        dprintf(STDERR_FILENO,
+                "sandbox child: launch cancelled before isolation: %s\n",
+                strerror(errno));
+        _exit(127);
+    }
+    (void)close(launch_read_descriptor);
+
+    if (sandbox_child_restrict_filesystem(options->target_path) != 0) {
+        dprintf(STDERR_FILENO,
+                "sandbox child: Landlock filesystem isolation failed: %s\n",
+                strerror(errno));
+        _exit(127);
+    }
+    if (sandbox_child_install_network_filter() != 0) {
+        dprintf(STDERR_FILENO,
+                "sandbox child: seccomp network isolation failed: %s\n",
+                strerror(errno));
+        _exit(127);
+    }
+    if (sandbox_child_close_descriptors() != 0) {
+        dprintf(STDERR_FILENO,
+                "sandbox child: descriptor cleanup failed: %s\n",
+                strerror(errno));
+        _exit(127);
+    }
+
+    execve(options->target_path, options->target_argv,
+           sandbox_child_environment());
+    dprintf(STDERR_FILENO, "sandbox child: execve(%s) failed: %s\n",
+            options->target_path, strerror(errno));
+    _exit(127);
+}
+
 int main(int argc, char **argv)
 {
     SandboxOptions options;
@@ -411,12 +600,15 @@ int main(int argc, char **argv)
     TimeoutMonitorConfig timeout_config;
     MemoryMonitorConfig memory_config;
     CpuMonitorConfig cpu_config;
+    SandboxCgroup cgroup;
     WorkloadStatus workload_status;
     SandboxTerminationReason termination_reason = SANDBOX_TERMINATION_NONE;
     pthread_t timeout_thread;
     pthread_t memory_thread;
     pthread_t cpu_thread;
     pid_t child_pid;
+    pid_t supervisor_pid = getpid();
+    int launch_pipe[2] = {-1, -1};
     int child_started = 0;
     int workload_finished = 0;
     int timeout_monitor_started = 0;
@@ -426,6 +618,7 @@ int main(int argc, char **argv)
     int exit_code = EXIT_FAILURE;
 
     memset(&workload_status, 0, sizeof(workload_status));
+    memset(&cgroup, 0, sizeof(cgroup));
     if (parse_options(argc, argv, &options) != 0) {
         print_usage(argv[0]);
         return EXIT_FAILURE;
@@ -438,11 +631,24 @@ int main(int argc, char **argv)
     if (enable_child_subreaper() != 0) {
         goto cleanup;
     }
+    if (install_operator_signal_handlers() != 0) {
+        logger_error("operator signal handler setup failed: %s",
+                     strerror(errno));
+        goto cleanup;
+    }
 
     logger_info("sandbox controller starting: target=%s timeout=%u seconds "
                 "memory_limit=%lu kB",
                 options.target_path, options.timeout_seconds,
                 options.memory_limit_kilobytes);
+
+    (void)sandbox_cgroup_prepare(&cgroup,
+                                 options.memory_limit_kilobytes);
+    if (pipe2(launch_pipe, O_CLOEXEC) != 0) {
+        logger_error("launch synchronization pipe failed: %s",
+                     strerror(errno));
+        goto cleanup;
+    }
 
     child_pid = fork();
     if (child_pid < 0) {
@@ -451,19 +657,13 @@ int main(int argc, char **argv)
     }
 
     if (child_pid == 0) {
-        if (setpgid(0, 0) != 0) {
-            dprintf(STDERR_FILENO,
-                    "sandbox child: setpgid() failed: %s\n",
-                    strerror(errno));
-            _exit(127);
-        }
-        execve(options.target_path, options.target_argv, environ);
-        dprintf(STDERR_FILENO, "sandbox child: execve(%s) failed: %s\n",
-                options.target_path, strerror(errno));
-        _exit(127);
+        run_sandbox_child(&options, launch_pipe[0], launch_pipe[1],
+                          supervisor_pid);
     }
 
     child_started = 1;
+    (void)close(launch_pipe[0]);
+    launch_pipe[0] = -1;
     if (setpgid(child_pid, child_pid) != 0 &&
         errno != EACCES && errno != ESRCH) {
         logger_error("parent setpgid(%ld) failed: %s",
@@ -479,15 +679,40 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    logger_info("supervising process tree: leader PID=%ld PGID=%ld "
-                "subreaper PID=%ld",
-                (long)child_pid, (long)child_pid, (long)getpid());
+    if (cgroup.active && sandbox_cgroup_attach(&cgroup, child_pid) != 0) {
+        logger_error("could not attach PID %ld to sandbox cgroup: %s",
+                     (long)child_pid, strerror(errno));
+        termination_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
+    }
+
+    if (operator_signal_number != 0) {
+        logger_warn("operator signal %d received during workload setup",
+                    (int)operator_signal_number);
+        termination_reason = SANDBOX_TERMINATION_OPERATOR_SIGNAL;
+    }
+
+    if (termination_reason == SANDBOX_TERMINATION_NONE &&
+        release_child(launch_pipe[1]) != 0) {
+        logger_error("could not release isolated child: %s", strerror(errno));
+        termination_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
+    }
+    (void)close(launch_pipe[1]);
+    launch_pipe[1] = -1;
+
+    logger_info("supervising workload: leader PID=%ld PGID=%ld "
+                "subreaper PID=%ld membership=%s",
+                (long)child_pid, (long)child_pid, (long)getpid(),
+                cgroup.active ? "cgroup v2" : "process-tree ancestry");
+    logger_info("child hardening active: Landlock filesystem allowlist, "
+                "seccomp network deny, minimal environment, closed FDs, "
+                "PR_SET_PDEATHSIG=SIGKILL");
 
     timeout_config.state = &state;
     timeout_config.timeout_seconds = options.timeout_seconds;
     timeout_config.poll_interval_milliseconds = MONITOR_POLL_MILLISECONDS;
 
     memory_config.state = &state;
+    memory_config.cgroup = &cgroup;
     memory_config.memory_limit_kilobytes = options.memory_limit_kilobytes;
     memory_config.poll_interval_milliseconds = MEMORY_POLL_MILLISECONDS;
 
@@ -537,22 +762,28 @@ int main(int argc, char **argv)
     }
 
     if (termination_reason != SANDBOX_TERMINATION_NONE) {
-        if (terminate_workload(&state, termination_reason,
+        if (terminate_workload(&state, &cgroup, termination_reason,
                                &workload_status) == 0) {
             workload_finished = 1;
         }
-    } else if (supervise_workload(&state, &workload_status,
+    } else if (supervise_workload(&state, &cgroup, &workload_status,
                                   &termination_reason) == 0) {
         workload_finished = 1;
     }
 
 cleanup:
+    if (launch_pipe[0] >= 0) {
+        (void)close(launch_pipe[0]);
+    }
+    if (launch_pipe[1] >= 0) {
+        (void)close(launch_pipe[1]);
+    }
     if (child_started && !workload_finished) {
         if (termination_reason == SANDBOX_TERMINATION_NONE) {
             termination_reason = SANDBOX_TERMINATION_SUPERVISOR_ERROR;
         }
         logger_warn("performing cleanup for an active workload tree");
-        if (terminate_workload(&state, termination_reason,
+        if (terminate_workload(&state, &cgroup, termination_reason,
                                &workload_status) == 0) {
             workload_finished = 1;
         }
@@ -596,6 +827,10 @@ cleanup:
                                         termination_reason);
     } else if (child_started) {
         logger_error("original workload leader status was not collected");
+    }
+
+    if (cgroup.active) {
+        (void)sandbox_cgroup_destroy(&cgroup);
     }
 
     if (state_initialized) {
