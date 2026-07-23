@@ -2,10 +2,10 @@ CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -pedantic
 THREAD_FLAGS ?= -pthread
 
-TASK1_DIR := task1-auth
+TASK1_DIR := Authentication
 TASK1_BUILD := $(TASK1_DIR)/build
 
-TASK2_DIR := task2-sandbox
+TASK2_DIR := Sandbox
 TASK2_BUILD := $(TASK2_DIR)/build
 TASK2_TEST_DIR := $(TASK2_DIR)/test
 TASK2_TEST_BINARIES := \
@@ -38,8 +38,8 @@ task2: $(TASK2_BUILD)/Sandbox task2-tests scripts
 task2-tests: $(TASK2_TEST_BINARIES)
 
 scripts:
-	@test -x task1-auth/run_task1.sh
-	@test -x task2-sandbox/run_task2.sh
+	@test -x $(TASK1_DIR)/run_auth_demo.sh
+	@test -x $(TASK2_DIR)/run_sandbox_demo.sh
 
 $(TASK2_BUILD):
 	mkdir -p $@
@@ -78,10 +78,10 @@ $(TASK2_BUILD)/memory_fork_hog: $(TASK2_TEST_DIR)/memory_fork_hog.c | $(TASK2_BU
 	$(CC) $(CFLAGS) -o $@ $<
 
 task1-demo: task1 scripts
-	./task1-auth/run_task1.sh
+	./$(TASK1_DIR)/run_auth_demo.sh
 
 task2-demo: task2 scripts
-	./task2-sandbox/run_task2.sh
+	./$(TASK2_DIR)/run_sandbox_demo.sh
 
 evidence:
 	@echo "Evidence is collected by the task run scripts."

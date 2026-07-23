@@ -152,7 +152,7 @@ static int resolve_demo_credential_path(char *path, size_t path_size, FILE *out)
 
     build_separator = strrchr(path, '/');
     if (build_separator == NULL) {
-        fputs("[backend] unable to locate task1-auth directory\n", out);
+        fputs("[backend] unable to locate authentication directory\n", out);
         return -1;
     }
     build_separator++;

@@ -4,9 +4,9 @@ set -eu
 cd "$(dirname "$0")/.."
 
 AUTH_SOCKET_PATH=/tmp/st5039cmd_auth.sock
-BACKEND=./task1-auth/build/Backend
-FRONTEND=./task1-auth/build/Frontend
-LOG_DIR=./task1-auth/build
+BACKEND=./Authentication/build/Backend
+FRONTEND=./Authentication/build/Frontend
+LOG_DIR=./Authentication/build
 backend_pid=
 
 cleanup()
@@ -55,7 +55,7 @@ run_case()
     username=$2
     password=$3
     expected_frontend_status=$4
-    log_file="$LOG_DIR/task1-$case_name.log"
+    log_file="$LOG_DIR/auth-$case_name.log"
 
     printf '\n=== %s ===\n' "$case_name"
     rm -f "$log_file"
@@ -93,5 +93,5 @@ run_case valid-login demo_user demo_password 0
 run_case wrong-password demo_user wrong_password 1
 run_case unknown-user unknown_user demo_password 1
 
-printf '\nTask 1 demonstration completed successfully.\n'
-printf 'Backend logs are available in %s/task1-*.log\n' "$LOG_DIR"
+printf '\nAuthentication demonstration completed successfully.\n'
+printf 'Backend logs are available in %s/auth-*.log\n' "$LOG_DIR"

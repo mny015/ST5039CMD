@@ -1,12 +1,12 @@
-# ST5039CMD CW1: Authentication and Sandbox Controller
+# ST5039CMD CW1: Authentication and Sandbox
 
 This repository contains both programs for ST5039CMD Programming and Operating
 Systems coursework CW1:
 
 | Task | Program | Purpose |
 |---|---|---|
-| 1 | `Frontend` and `Backend` | Demonstrate local IPC, peer identity checking, permanent privilege dropping, bounded input, and sensitive-memory cleanup. |
-| 2 | `Sandbox` | Run and supervise a complete process tree with timeout, memory, CPU, filesystem, network, environment, descriptor, and cleanup controls. |
+| 1 | Authentication (`Frontend` and `Backend`) | Demonstrate local IPC, peer identity checking, permanent privilege dropping, bounded input, and sensitive-memory cleanup. |
+| 2 | Sandbox (`Sandbox` controller) | Run and supervise a complete process tree with timeout, memory, CPU, filesystem, network, environment, descriptor, and cleanup controls. |
 
 The programs target Linux. Run the assessed demonstrations in the coursework
 Linux VM because they depend on Linux-specific kernel facilities and security
@@ -18,8 +18,8 @@ From the repository root:
 
 ```sh
 make task1 task2
-./task1-auth/run_task1.sh
-./task2-sandbox/run_task2.sh
+./Authentication/run_auth_demo.sh
+./Sandbox/run_sandbox_demo.sh
 ```
 
 The first command builds both tasks and the Task 2 test programs. Each run
@@ -62,30 +62,30 @@ uname -a
 ST5039CMD/
 |-- README.md
 |-- Makefile
-|-- task1-auth/
+|-- Authentication/
 |   |-- Frontend.c
 |   |-- Backend.c
 |   |-- auth_protocol.h
 |   |-- secure_memory.c
 |   |-- secure_memory.h
 |   |-- credentials.demo
-|   `-- run_task1.sh
-|-- task2-sandbox/
+|   `-- run_auth_demo.sh
+|-- Sandbox/
 |   |-- Sandbox.c
 |   |-- monitor.c / monitor.h
 |   |-- process_tree.c / process_tree.h
 |   |-- security.c / security.h
 |   |-- logger.c / logger.h
-|   |-- run_task2.sh
+|   |-- run_sandbox_demo.sh
 |   `-- test/                 # focused target programs used by the test suite
 `-- diagrams/
-    |-- task1-architecture.png
-    |-- task2-architecture.png
+    |-- authentication.png
+    |-- sandbox.png
     `-- screenshots/          # captured build, automated, and manual evidence
 ```
 
-Generated executables and logs are placed under `task1-auth/build/` and
-`task2-sandbox/build/`. Both directories are ignored by Git.
+Generated executables and logs are placed under `Authentication/build/` and
+`Sandbox/build/`. Both directories are ignored by Git.
 
 ## Building the Programs
 
@@ -101,7 +101,7 @@ The available Make targets are:
 
 | Target | Result |
 |---|---|
-| `make task1` | Builds `task1-auth/build/Frontend` and `task1-auth/build/Backend`. |
+| `make task1` | Builds `Authentication/build/Frontend` and `Authentication/build/Backend`. |
 | `make task2` | Builds `Sandbox`, all Task 2 test binaries, and checks that both run scripts are executable. |
 | `make task2-tests` | Builds only the Task 2 target/test binaries. |
 | `make task1-demo` | Builds Task 1 and runs its automated demonstration. |
@@ -119,18 +119,18 @@ make task1 task2
 Successful compilation creates these main executables:
 
 ```text
-task1-auth/build/Frontend
-task1-auth/build/Backend
-task2-sandbox/build/Sandbox
+Authentication/build/Frontend
+Authentication/build/Backend
+Sandbox/build/Sandbox
 ```
 
 ![Building both projects](<diagrams/screenshots/Building the projects (Automatic).png>)
 
-## Task 1 User Guide: Privilege-Separated Authentication
+## Task 1 User Guide: Authentication
 
 ### Architecture and Security Flow
 
-![Task 1 privilege-separated authentication architecture](diagrams/task1-architecture.png)
+![Task 1 privilege-separated authentication architecture](diagrams/authentication.png)
 
 The backend performs its security-sensitive setup in this order:
 
@@ -155,7 +155,7 @@ Username: demo_user
 Password: demo_password
 ```
 
-Never place a real username or password in `task1-auth/credentials.demo`.
+Never place a real username or password in `Authentication/credentials.demo`.
 
 ### Optional Set-User-ID Setup for the Full Privilege-Drop Demonstration
 
@@ -166,9 +166,9 @@ isolated coursework VM:
 
 ```sh
 make task1
-sudo chown root:root task1-auth/build/Backend
-sudo chmod 4755 task1-auth/build/Backend
-ls -l task1-auth/build/Backend
+sudo chown root:root Authentication/build/Backend
+sudo chmod 4755 Authentication/build/Backend
+ls -l Authentication/build/Backend
 ```
 
 The `ls` output should show an `s` in the owner's execute position, such as
@@ -182,14 +182,14 @@ is required.
 Run:
 
 ```sh
-./task1-auth/run_task1.sh
+./Authentication/run_auth_demo.sh
 ```
 
 If executable permissions were lost while copying or extracting the project,
 restore them once with:
 
 ```sh
-chmod +x task1-auth/run_task1.sh task2-sandbox/run_task2.sh
+chmod +x Authentication/run_auth_demo.sh Sandbox/run_sandbox_demo.sh
 ```
 
 The script builds Task 1 and runs a new one-connection backend for each case:
@@ -203,16 +203,16 @@ The script builds Task 1 and runs a new one-connection backend for each case:
 The final line must be:
 
 ```text
-Task 1 demonstration completed successfully.
+Authentication demonstration completed successfully.
 ```
 
 The script also writes one backend log per case:
 
 ```sh
-ls -l task1-auth/build/task1-*.log
-cat task1-auth/build/task1-valid-login.log
-cat task1-auth/build/task1-wrong-password.log
-cat task1-auth/build/task1-unknown-user.log
+ls -l Authentication/build/auth-*.log
+cat Authentication/build/auth-valid-login.log
+cat Authentication/build/auth-wrong-password.log
+cat Authentication/build/auth-unknown-user.log
 ```
 
 The logs show UID state before and after the permanent drop, the socket path,
@@ -246,7 +246,7 @@ binary.
 Still in **Terminal A**, run:
 
 ```sh
-./task1-auth/build/Backend
+./Authentication/build/Backend
 ```
 
 Do not type the frontend credentials into this terminal. Wait until the backend
@@ -266,7 +266,7 @@ In **Terminal B**, move to the same repository root and run:
 
 ```sh
 cd /path/to/ST5039CMD
-./task1-auth/build/Frontend
+./Authentication/build/Frontend
 ```
 
 At `Username:`, type `demo_user` and press Enter. At `Password:`, type
@@ -300,7 +300,7 @@ For every new login attempt, first restart this command in Terminal A and wait
 for `listening` again:
 
 ```sh
-./task1-auth/build/Backend
+./Authentication/build/Backend
 ```
 
 Then run `Frontend` again in Terminal B and enter each test pair:
@@ -326,11 +326,11 @@ backend in Terminal A with `Ctrl+C` before starting the next case.
 
 ![Task 1 manual valid and invalid cases](<diagrams/screenshots/testing all cases;task1.jpeg>)
 
-## Task 2 User Guide: Sandbox Controller
+## Task 2 User Guide: Sandbox
 
 ### Updated Architecture
 
-![Task 2 sandbox controller architecture](diagrams/task2-architecture.png)
+![Task 2 sandbox controller architecture](diagrams/sandbox.png)
 
 The parent controller is the only component that sends workload signals,
 reaps processes, decides the final status, and performs cleanup. The timeout,
@@ -365,7 +365,7 @@ Sandbox [--timeout SECONDS] [--memory-kb KILOBYTES] <target-binary> [args...]
 |---|---|
 | `--timeout SECONDS` | Wall-clock timeout from 1 to 86400 seconds. Default: 5 seconds. |
 | `--memory-kb KILOBYTES` | Memory ceiling from 1 to 4194304 kB. Memory enforcement is disabled when omitted. |
-| `<target-binary>` | Executable path passed directly to `execve()`; use a built binary such as `./task2-sandbox/build/normal_exit`. |
+| `<target-binary>` | Executable path passed directly to `execve()`; use a built binary such as `./Sandbox/build/normal_exit`. |
 | `[args...]` | Optional arguments passed unchanged to the target. |
 
 CPU usage is always monitored and reported; there is no CPU-kill threshold.
@@ -381,7 +381,7 @@ hardening failure, or supervisor/monitor error.
 Run the complete suite from the repository root:
 
 ```sh
-./task2-sandbox/run_task2.sh
+./Sandbox/run_sandbox_demo.sh
 ```
 
 The script builds Task 2 and checks all twelve demonstrations:
@@ -406,7 +406,7 @@ those exact values as passes and itself finishes with `0`. The final line must
 be:
 
 ```text
-Task 2 demonstration completed successfully.
+Sandbox demonstration completed successfully.
 ```
 
 Seeing `cgroup delegation unavailable` is not a test failure. It means the
@@ -417,7 +417,7 @@ ancestry` membership is active.
 To measure the complete suite:
 
 ```sh
-time ./task2-sandbox/run_task2.sh
+time ./Sandbox/run_sandbox_demo.sh
 ```
 
 ![Task 2 automated test run](<diagrams/screenshots/Automated task2 testing.jpeg>)
@@ -445,8 +445,8 @@ text. PIDs and exact CPU/memory samples will differ between runs.
 #### 1. Normal completion
 
 ```sh
-./task2-sandbox/build/Sandbox --timeout 3 \
-  ./task2-sandbox/build/normal_exit
+./Sandbox/build/Sandbox --timeout 3 \
+  ./Sandbox/build/normal_exit
 status=$?
 printf 'Sandbox exit status: %s\n' "$status"
 ```
@@ -458,8 +458,8 @@ descendants remain`.
 #### 2. Timeout and graceful `SIGTERM`
 
 ```sh
-./task2-sandbox/build/Sandbox --timeout 2 \
-  ./task2-sandbox/build/sleep_long
+./Sandbox/build/Sandbox --timeout 2 \
+  ./Sandbox/build/sleep_long
 status=$?
 printf 'Sandbox exit status: %s\n' "$status"
 ```
@@ -471,8 +471,8 @@ escalation. The 300-second test process must not remain running.
 #### 3. Memory across descendants
 
 ```sh
-./task2-sandbox/build/Sandbox --timeout 10 --memory-kb 24576 \
-  ./task2-sandbox/build/memory_fork_hog
+./Sandbox/build/Sandbox --timeout 10 --memory-kb 24576 \
+  ./Sandbox/build/memory_fork_hog
 status=$?
 printf 'Sandbox exit status: %s\n' "$status"
 ```
@@ -489,8 +489,8 @@ limit exceeded`.
 #### 4. CPU monitoring
 
 ```sh
-./task2-sandbox/build/Sandbox --timeout 2 \
-  ./task2-sandbox/build/infinite_loop
+./Sandbox/build/Sandbox --timeout 2 \
+  ./Sandbox/build/infinite_loop
 status=$?
 printf 'Sandbox exit status: %s\n' "$status"
 ```
@@ -502,8 +502,8 @@ timeout cleanup.
 #### 5. Forced `SIGKILL` escalation
 
 ```sh
-./task2-sandbox/build/Sandbox --timeout 1 \
-  ./task2-sandbox/build/ignore_sigterm
+./Sandbox/build/Sandbox --timeout 1 \
+  ./Sandbox/build/ignore_sigterm
 status=$?
 printf 'Sandbox exit status: %s\n' "$status"
 ```
@@ -516,8 +516,8 @@ ms`, `escalating tree to SIGKILL`, and `signal 9 delivered`.
 #### 6. Detached-descendant cleanup
 
 ```sh
-./task2-sandbox/build/Sandbox --timeout 1 \
-  ./task2-sandbox/build/fork_escape
+./Sandbox/build/Sandbox --timeout 1 \
+  ./Sandbox/build/fork_escape
 status=$?
 printf 'Sandbox exit status: %s\n' "$status"
 ```
@@ -529,8 +529,8 @@ discovers, kills, and reaps that descendant before returning.
 #### 7. Network isolation
 
 ```sh
-./task2-sandbox/build/Sandbox --timeout 3 \
-  ./task2-sandbox/build/network_attempt
+./Sandbox/build/Sandbox --timeout 3 \
+  ./Sandbox/build/network_attempt
 status=$?
 printf 'Sandbox exit status: %s\n' "$status"
 ```
@@ -542,8 +542,8 @@ verified: socket creation denied`.
 #### 8. Filesystem isolation
 
 ```sh
-./task2-sandbox/build/Sandbox --timeout 3 \
-  ./task2-sandbox/build/filesystem_attempt
+./Sandbox/build/Sandbox --timeout 3 \
+  ./Sandbox/build/filesystem_attempt
 status=$?
 printf 'Sandbox exit status: %s\n' "$status"
 ```
@@ -560,8 +560,8 @@ controller's environment:
 ```sh
 exec 9<README.md
 SECRET_TEST_TOKEN=must-not-leak \
-  ./task2-sandbox/build/Sandbox --timeout 3 \
-  ./task2-sandbox/build/environment_fds
+  ./Sandbox/build/Sandbox --timeout 3 \
+  ./Sandbox/build/environment_fds
 status=$?
 exec 9<&-
 printf 'Sandbox exit status: %s\n' "$status"
@@ -578,8 +578,8 @@ the target leader PID, then sends `SIGTERM` only to that recorded controller:
 
 ```sh
 log_file=$(mktemp)
-./task2-sandbox/build/Sandbox --timeout 30 \
-  ./task2-sandbox/build/sleep_long >"$log_file" 2>&1 &
+./Sandbox/build/Sandbox --timeout 30 \
+  ./Sandbox/build/sleep_long >"$log_file" 2>&1 &
 controller_pid=$!
 
 while ! grep -q 'leader PID=' "$log_file"; do sleep 0.1; done
@@ -629,7 +629,7 @@ Important distinctions:
 - `network isolation verified` and `filesystem isolation verified` mean denied
   operations were tested successfully.
 - A sandbox exit status of `1` is expected for policy-killed manual cases, but
-  the complete `run_task2.sh` script should still return `0`.
+  the complete `run_sandbox_demo.sh` script should still return `0`.
 - `sandbox child: Landlock filesystem isolation failed` or `sandbox child:
   seccomp network isolation failed` means the host kernel cannot provide a
   required policy; move the test to the coursework VM.
@@ -656,7 +656,7 @@ are correct, and that the test is running directly in the coursework Linux VM:
 
 ```sh
 id
-ls -l task1-auth/build/Backend
+ls -l Authentication/build/Backend
 ```
 
 The backend deliberately refuses to use UID `0` as its drop target. User
@@ -674,7 +674,7 @@ create a child cgroup beneath its current cgroup.
 Confirm the target path exists and is executable:
 
 ```sh
-ls -l ./task2-sandbox/build/normal_exit
+ls -l ./Sandbox/build/normal_exit
 ```
 
 Also check the preceding `sandbox child:` message. It identifies `execve()`,
@@ -697,3 +697,14 @@ The screenshots under `diagrams/screenshots/` are example evidence captured in
 the coursework environment. UID/GID values, PIDs, timings, memory samples, and
 cgroup availability naturally vary between machines. The commands and pass
 conditions in this guide are authoritative.
+
+These evidence screenshots were captured before the descriptive rename and
+therefore show the former names. They document the same implementation:
+
+| Name visible in earlier screenshots | Current repository name |
+|---|---|
+| `task1-auth/` | `Authentication/` |
+| `task2-sandbox/` | `Sandbox/` |
+| `run_task1.sh` | `run_auth_demo.sh` |
+| `run_task2.sh` | `run_sandbox_demo.sh` |
+| `task1-*.log` | `auth-*.log` |

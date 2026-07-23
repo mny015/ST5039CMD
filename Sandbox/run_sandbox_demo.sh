@@ -3,8 +3,8 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-SANDBOX=./task2-sandbox/build/Sandbox
-TEST_DIR=./task2-sandbox/build
+SANDBOX=./Sandbox/build/Sandbox
+TEST_DIR=./Sandbox/build
 
 run_case()
 {
@@ -136,4 +136,4 @@ exec 9<&-
 run_controller_signal_case operator-signal-cleanup TERM
 run_controller_signal_case parent-death-signal KILL
 
-printf '\nTask 2 demonstration completed successfully.\n'
+printf '\nSandbox demonstration completed successfully.\n'
